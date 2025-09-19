@@ -1,4 +1,12 @@
-import importlib
+"""Package initialization for :mod:`mmm_ai`.
+
+This module wires up lightweight stand-ins for optional third-party
+dependencies so that the test suite can import the package without the real
+services installed.  The actual package implementation now lives directly
+under the top-level ``mmm_ai`` directory instead of being nested under
+``mmm_ai/src``.
+"""
+
 import os
 import sys
 import types
@@ -102,5 +110,10 @@ if "gai_templates" not in sys.modules:
     sys.modules["gai_templates.common.constants"] = constants_module
     sys.modules["gai_templates.omni_llm_v2"] = omni_module
 
-_pkg = importlib.import_module(".src.mmm_ai", __name__)
-sys.modules[__name__] = _pkg
+__all__ = [
+    "agents",
+    "app",
+    "config",
+    "llm",
+    "tools",
+]
