@@ -11,6 +11,7 @@ from .summaries import (
     posterior_mean,
     summarise_decay_rates,
 )
+from .ensemble import EnsembleResult, PerModelResult, ensemble
 
 __all__ = [
     "Hierarchy",
@@ -25,4 +26,7 @@ __all__ = [
     "compute_contributions_from_params",
     "posterior_mean",
     "summarise_decay_rates",
+    "ensemble",
+    "PerModelResult",
+    "EnsembleResult",
 ]
