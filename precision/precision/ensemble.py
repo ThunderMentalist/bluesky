@@ -3,23 +3,51 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+from .adstock import adstock_geometric_np
 from .hierarchy import Hierarchy
 from .posterior import make_target_log_prob_fn
 from .priors import Priors
-from .sampling import run_nuts
+from .sampling import PosteriorSamples, run_nuts
 from .summaries import (
     Contributions,
-    compute_contributions_from_params,
     posterior_mean,
     summarise_decay_rates,
 )
 
 MetricName = str
+
+
+@dataclass
+class ContributionInterval:
+    """Lower and upper credible interval bounds for a contribution table."""
+
+    lower: pd.DataFrame
+    upper: pd.DataFrame
+
+
+@dataclass
+class ContributionIntervalSeries:
+    """Lower and upper credible interval bounds for a contribution series."""
+
+    lower: pd.Series
+    upper: pd.Series
+
+
+@dataclass
+class ContributionUncertainty:
+    """Posterior interval summaries for contributions at multiple levels."""
+
+    tactical: ContributionInterval
+    platform: ContributionInterval
+    channel: ContributionInterval
+    controls: ContributionInterval
+    intercept: ContributionIntervalSeries
+    fitted: ContributionIntervalSeries
 
 
 @dataclass
@@ -30,6 +58,8 @@ class PerModelResult:
     post_mean: Dict[str, np.ndarray]
     decay_df: pd.DataFrame
     contributions: Contributions
+    uncertainty: ContributionUncertainty
+    log_likelihood_draws: np.ndarray
     r2: float
     rmse: float
     mae: float
@@ -44,6 +74,7 @@ class EnsembleResult:
     per_model: Dict[MetricName, PerModelResult]
     weights: Dict[MetricName, float]
     contributions_weighted: Contributions
+    uncertainty_weighted: ContributionUncertainty
 
 
 def _fill_missing_metrics_per_tactical(
@@ -53,9 +84,10 @@ def _fill_missing_metrics_per_tactical(
 ) -> Dict[MetricName, np.ndarray]:
     """Ensure each metric has a complete [T, N_t] matrix.
 
-    If a metric is missing entirely or unavailable for specific tacticals, the
-    corresponding values are copied from the first available metric defined by
-    ``fallback_order``.
+    If a metric is missing entirely, a zero matrix of matching shape is used. For
+    tacticals where a metric is unavailable according to ``availability`` the
+    corresponding columns are set to zero rather than copied from other metrics,
+    avoiding duplicated exposure signals across models.
     """
 
     metric_keys = ["impressions", "clicks", "conversions"]
@@ -76,38 +108,152 @@ def _fill_missing_metrics_per_tactical(
     for name in metric_keys:
         matrix = U_metrics.get(name)
         if matrix is None:
-            U_full[name] = ref_matrix.copy()
+            matrix = np.zeros_like(ref_matrix)
         else:
             if matrix.shape != (T, num_tacticals):
                 raise ValueError(
                     f"U_metrics[{name}] has shape {matrix.shape}, expected {(T, num_tacticals)}"
                 )
-            U_full[name] = matrix.copy()
+            matrix = matrix.copy()
 
-    for tactical_idx in range(num_tacticals):
-        for name in metric_keys:
-            metric_availability = availability.get(name)
-            if metric_availability is not None and not bool(metric_availability[tactical_idx]):
-                replaced = False
-                for fallback in fallback_order:
-                    fallback_avail = availability.get(fallback)
-                    has_fallback = True
-                    if fallback_avail is not None:
-                        has_fallback = bool(fallback_avail[tactical_idx])
-                    if has_fallback and U_full.get(fallback) is not None:
-                        U_full[name][:, tactical_idx] = U_full[fallback][:, tactical_idx]
-                        replaced = True
-                        break
-                if not replaced:
-                    for fallback in fallback_order:
-                        if U_full.get(fallback) is not None:
-                            U_full[name][:, tactical_idx] = U_full[fallback][:, tactical_idx]
-                            replaced = True
-                            break
-                if not replaced:
-                    raise RuntimeError("Unable to fill missing tactical column for metric availability.")
+        metric_availability = availability.get(name)
+        if metric_availability is not None:
+            if metric_availability.shape[0] != num_tacticals:
+                raise ValueError(
+                    f"availability[{name}] has length {metric_availability.shape[0]}, expected {num_tacticals}"
+                )
+            mask = metric_availability.astype(bool)
+            if not np.all(mask):
+                matrix[:, ~mask] = 0.0
+        U_full[name] = matrix
 
     return U_full
+
+
+def _get_control_names(control_names: Optional[List[str]], num_controls: int) -> List[str]:
+    if num_controls == 0:
+        return []
+    if control_names is None:
+        return [f"control_{idx}" for idx in range(num_controls)]
+    if len(control_names) != num_controls:
+        raise ValueError(
+            f"Expected {num_controls} control names, received {len(control_names)}."
+        )
+    return list(control_names)
+
+
+def _compute_contribution_arrays(
+    U: np.ndarray,
+    Z: Optional[np.ndarray],
+    hierarchy: Hierarchy,
+    *,
+    beta0: float,
+    beta_channel: np.ndarray,
+    gamma: np.ndarray,
+    delta: np.ndarray,
+    normalize_adstock: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute contribution arrays for a single parameter draw."""
+
+    adstocked = adstock_geometric_np(U, delta, normalize=normalize_adstock)
+    beta_per_tactical = hierarchy.M_tc @ beta_channel
+    tactical = adstocked * beta_per_tactical[None, :]
+    platform = tactical @ hierarchy.M_tp
+    channel = tactical @ hierarchy.M_tc
+
+    if Z is None or gamma.size == 0:
+        control = np.zeros((U.shape[0], 0))
+    else:
+        gamma = np.atleast_1d(gamma)
+        if gamma.ndim == 1:
+            control = Z * gamma[None, :]
+        else:
+            control = Z @ gamma
+
+    intercept = np.full(U.shape[0], float(beta0))
+    fitted = intercept + channel.sum(axis=1)
+    if control.size > 0:
+        fitted = fitted + control.sum(axis=1)
+
+    return tactical, platform, channel, control, intercept, fitted
+
+
+def _arrays_to_dataframe(
+    values: np.ndarray,
+    index: pd.Index,
+    columns: List[str],
+) -> pd.DataFrame:
+    if values.size == 0:
+        return pd.DataFrame(index=index, columns=columns, dtype=float)
+    return pd.DataFrame(values, index=index, columns=columns)
+
+
+def _arrays_to_series(values: np.ndarray, index: pd.Index, name: str) -> pd.Series:
+    return pd.Series(values, index=index, name=name)
+
+
+def _make_contributions_from_arrays(
+    *,
+    hierarchy: Hierarchy,
+    control_names: List[str],
+    tactical: np.ndarray,
+    platform: np.ndarray,
+    channel: np.ndarray,
+    controls: np.ndarray,
+    intercept: np.ndarray,
+    fitted: np.ndarray,
+) -> Contributions:
+    index = pd.RangeIndex(tactical.shape[0], name="time")
+    tactical_df = _arrays_to_dataframe(tactical, index, hierarchy.tactical_names)
+    platform_df = _arrays_to_dataframe(platform, index, hierarchy.platform_names)
+    channel_df = _arrays_to_dataframe(channel, index, hierarchy.channel_names)
+    controls_df = _arrays_to_dataframe(controls, index, control_names)
+    intercept_series = _arrays_to_series(intercept, index, "intercept")
+    fitted_series = _arrays_to_series(fitted, index, "fitted")
+
+    return Contributions(
+        tactical=tactical_df,
+        platform=platform_df,
+        channel=channel_df,
+        controls=controls_df,
+        intercept=intercept_series,
+        fitted=fitted_series,
+        tactical_totals=tactical_df.sum(axis=0),
+        platform_totals=platform_df.sum(axis=0),
+        channel_totals=channel_df.sum(axis=0),
+        controls_totals=controls_df.sum(axis=0),
+        intercept_total=float(intercept_series.sum()),
+        fitted_total=float(fitted_series.sum()),
+    )
+
+
+def _summarise_draws(
+    draws: np.ndarray,
+    index: pd.Index,
+    columns: List[str],
+    *,
+    lower: float = 0.05,
+    upper: float = 0.95,
+) -> ContributionInterval:
+    if draws.size == 0:
+        empty = pd.DataFrame(index=index, columns=columns, dtype=float)
+        return ContributionInterval(lower=empty.copy(), upper=empty.copy())
+    lower_df = pd.DataFrame(np.quantile(draws, lower, axis=0), index=index, columns=columns)
+    upper_df = pd.DataFrame(np.quantile(draws, upper, axis=0), index=index, columns=columns)
+    return ContributionInterval(lower=lower_df, upper=upper_df)
+
+
+def _summarise_draws_series(
+    draws: np.ndarray,
+    index: pd.Index,
+    name: str,
+    *,
+    lower: float = 0.05,
+    upper: float = 0.95,
+) -> ContributionIntervalSeries:
+    lower_series = pd.Series(np.quantile(draws, lower, axis=0), index=index, name=name)
+    upper_series = pd.Series(np.quantile(draws, upper, axis=0), index=index, name=name)
+    return ContributionIntervalSeries(lower=lower_series, upper=upper_series)
 
 
 def _fit_single_metric_model(
@@ -136,24 +282,75 @@ def _fit_single_metric_model(
     post_mean = posterior_mean(samples)
     decay_df = summarise_decay_rates(samples, hierarchy)
 
-    contributions = compute_contributions_from_params(
-        y=y,
-        U_tactical=U,
-        Z_controls=Z,
-        control_names=control_names,
+    stacked: PosteriorSamples = samples.stack_chains()
+    num_draws = stacked.beta0.shape[0]
+    T, num_tacticals = U.shape
+    num_platforms = hierarchy.num_platforms
+    num_channels = hierarchy.num_channels
+    num_controls = 0 if Z is None else Z.shape[1]
+    control_names_full = _get_control_names(control_names, num_controls)
+
+    tactical_draws = np.zeros((num_draws, T, num_tacticals))
+    platform_draws = np.zeros((num_draws, T, num_platforms))
+    channel_draws = np.zeros((num_draws, T, num_channels))
+    controls_draws = np.zeros((num_draws, T, num_controls))
+    intercept_draws = np.zeros((num_draws, T))
+    fitted_draws = np.zeros((num_draws, T))
+
+    log_likelihood_draws = np.zeros((num_draws, T))
+
+    for idx in range(num_draws):
+        tactical, platform, channel, controls_arr, intercept, fitted = _compute_contribution_arrays(
+            U,
+            Z,
+            hierarchy,
+            beta0=float(stacked.beta0[idx]),
+            beta_channel=stacked.beta_channel[idx],
+            gamma=stacked.gamma[idx] if stacked.gamma.size > 0 else np.zeros((num_controls,)),
+            delta=stacked.delta[idx],
+            normalize_adstock=normalize_adstock,
+        )
+
+        tactical_draws[idx] = tactical
+        platform_draws[idx] = platform
+        channel_draws[idx] = channel
+        if num_controls > 0:
+            controls_draws[idx] = controls_arr
+        intercept_draws[idx] = intercept
+        fitted_draws[idx] = fitted
+
+        sigma = max(float(stacked.sigma[idx]), 1e-9)
+        resid = y - fitted
+        log_likelihood_draws[idx] = -0.5 * (
+            (resid**2) / (sigma**2) + np.log(2.0 * np.pi * (sigma**2))
+        )
+
+    index = pd.RangeIndex(T, name="time")
+    contributions_mean = _make_contributions_from_arrays(
         hierarchy=hierarchy,
-        beta0=post_mean["beta0"],
-        beta_channel=post_mean["beta_channel"],
-        gamma=post_mean["gamma"],
-        delta=post_mean["delta"],
-        normalize_adstock=normalize_adstock,
+        control_names=control_names_full,
+        tactical=tactical_draws.mean(axis=0),
+        platform=platform_draws.mean(axis=0),
+        channel=channel_draws.mean(axis=0),
+        controls=controls_draws.mean(axis=0) if num_controls > 0 else controls_draws.mean(axis=0),
+        intercept=intercept_draws.mean(axis=0),
+        fitted=fitted_draws.mean(axis=0),
     )
 
-    residuals = y - contributions.fitted.values
-    rmse = float(np.sqrt(np.mean(residuals**2)))
-    mae = float(np.mean(np.abs(residuals)))
+    uncertainty = ContributionUncertainty(
+        tactical=_summarise_draws(tactical_draws, index, hierarchy.tactical_names),
+        platform=_summarise_draws(platform_draws, index, hierarchy.platform_names),
+        channel=_summarise_draws(channel_draws, index, hierarchy.channel_names),
+        controls=_summarise_draws(controls_draws, index, control_names_full),
+        intercept=_summarise_draws_series(intercept_draws, index, "intercept"),
+        fitted=_summarise_draws_series(fitted_draws, index, "fitted"),
+    )
+
+    residuals_mean = y - contributions_mean.fitted.values
+    rmse = float(np.sqrt(np.mean(residuals_mean**2)))
+    mae = float(np.mean(np.abs(residuals_mean)))
     sst = float(np.sum((y - np.mean(y)) ** 2))
-    sse = float(np.sum(residuals**2))
+    sse = float(np.sum(residuals_mean**2))
     r2 = float(1.0 - sse / sst) if sst > 0 else np.nan
     sigma_mean = float(post_mean["sigma"])
 
@@ -161,7 +358,9 @@ def _fit_single_metric_model(
         metric=metric,
         post_mean=post_mean,
         decay_df=decay_df,
-        contributions=contributions,
+        contributions=contributions_mean,
+        uncertainty=uncertainty,
+        log_likelihood_draws=log_likelihood_draws,
         r2=r2,
         rmse=rmse,
         mae=mae,
@@ -170,12 +369,67 @@ def _fit_single_metric_model(
     )
 
 
+def _stacking_weights_from_loglik(
+    loglik: Dict[MetricName, np.ndarray],
+    *,
+    max_iter: int = 2000,
+    lr: float = 0.1,
+    tol: float = 1e-7,
+) -> Dict[MetricName, float]:
+    """Exponentiated-gradient solver for stacking weights."""
+
+    keys = list(loglik.keys())
+    if not keys:
+        return {}
+
+    log_p = []
+    for key in keys:
+        draws = loglik[key]
+        if draws.ndim != 2:
+            raise ValueError("log_likelihood_draws must have shape [draws, T].")
+        # log predictive density per observation via log-mean-exp across draws
+        max_draw = np.max(draws, axis=0, keepdims=True)
+        log_mean = max_draw + np.log(np.mean(np.exp(draws - max_draw), axis=0, keepdims=True))
+        log_p.append(log_mean.squeeze(0))
+    log_p_matrix = np.stack(log_p, axis=0)  # [M, T]
+
+    w = np.ones(len(keys)) / len(keys)
+    previous = -np.inf
+    for _ in range(max_iter):
+        max_log = np.max(log_p_matrix, axis=0, keepdims=True)
+        scaled = np.exp(log_p_matrix - max_log)
+        denom = np.dot(w, scaled)
+        denom = np.clip(denom, 1e-300, np.inf)
+        objective = float(np.sum(np.log(denom) + max_log.squeeze(0)))
+        grad = np.sum(scaled / denom, axis=1)
+        w_new = w * np.exp(lr * grad)
+        w_new = np.clip(w_new, 1e-12, np.inf)
+        w_new = w_new / w_new.sum()
+        if np.linalg.norm(w_new - w, ord=1) < tol:
+            w = w_new
+            previous = objective
+            break
+        w, previous = w_new, objective
+
+    if not np.all(np.isfinite(w)):
+        w = np.ones(len(keys)) / len(keys)
+
+    return {keys[idx]: float(w[idx]) for idx in range(len(keys))}
+
+
 def _compute_weights(
     per_model: Dict[MetricName, PerModelResult],
     scheme: str,
     power: float,
 ) -> Dict[MetricName, float]:
     """Compute model weights under the requested ``scheme``."""
+
+    if scheme == "stacking":
+        weights = _stacking_weights_from_loglik(
+            {name: result.log_likelihood_draws for name, result in per_model.items()}
+        )
+        if weights:
+            return weights
 
     metrics: Dict[MetricName, float] = {}
     for name, result in per_model.items():
@@ -190,7 +444,9 @@ def _compute_weights(
         elif scheme == "uniform":
             metrics[name] = 1.0
         else:
-            raise ValueError("Unknown weighting scheme. Use 'r2', 'rmse', 'mae', 'sigma', or 'uniform'.")
+            raise ValueError(
+                "Unknown weighting scheme. Use 'stacking', 'r2', 'rmse', 'mae', 'sigma', or 'uniform'."
+            )
 
     raw = {name: value**power for name, value in metrics.items()}
     total = sum(raw.values())
@@ -256,6 +512,58 @@ def _aggregate_contributions(
     )
 
 
+def _weighted_interval_frames(
+    intervals: Dict[MetricName, ContributionInterval],
+    weights: Dict[MetricName, float],
+) -> ContributionInterval:
+    lower: Optional[pd.DataFrame] = None
+    upper: Optional[pd.DataFrame] = None
+    for name, interval in intervals.items():
+        w = weights[name]
+        if lower is None:
+            lower = interval.lower * w
+            upper = interval.upper * w
+        else:
+            lower = lower + interval.lower * w
+            upper = upper + interval.upper * w
+    if lower is None or upper is None:
+        raise ValueError("No intervals provided for aggregation.")
+    return ContributionInterval(lower=lower, upper=upper)
+
+
+def _weighted_interval_series(
+    intervals: Dict[MetricName, ContributionIntervalSeries],
+    weights: Dict[MetricName, float],
+) -> ContributionIntervalSeries:
+    lower: Optional[pd.Series] = None
+    upper: Optional[pd.Series] = None
+    for name, interval in intervals.items():
+        w = weights[name]
+        if lower is None:
+            lower = interval.lower * w
+            upper = interval.upper * w
+        else:
+            lower = lower + interval.lower * w
+            upper = upper + interval.upper * w
+    if lower is None or upper is None:
+        raise ValueError("No intervals provided for aggregation.")
+    return ContributionIntervalSeries(lower=lower, upper=upper)
+
+
+def _aggregate_uncertainty(
+    per_model: Dict[MetricName, PerModelResult],
+    weights: Dict[MetricName, float],
+) -> ContributionUncertainty:
+    return ContributionUncertainty(
+        tactical=_weighted_interval_frames({k: v.uncertainty.tactical for k, v in per_model.items()}, weights),
+        platform=_weighted_interval_frames({k: v.uncertainty.platform for k, v in per_model.items()}, weights),
+        channel=_weighted_interval_frames({k: v.uncertainty.channel for k, v in per_model.items()}, weights),
+        controls=_weighted_interval_frames({k: v.uncertainty.controls for k, v in per_model.items()}, weights),
+        intercept=_weighted_interval_series({k: v.uncertainty.intercept for k, v in per_model.items()}, weights),
+        fitted=_weighted_interval_series({k: v.uncertainty.fitted for k, v in per_model.items()}, weights),
+    )
+
+
 def ensemble(
     *,
     hierarchy: Hierarchy,
@@ -268,15 +576,15 @@ def ensemble(
     normalize_adstock: bool = False,
     priors: Optional[Priors] = None,
     nuts_args: Optional[Dict] = None,
-    weight_scheme: str = "r2",
+    weight_scheme: str = "stacking",
     weight_power: float = 1.0,
 ) -> EnsembleResult:
     """Fit per-metric MMMs and aggregate their contributions.
 
     Parameters mirror the lower-level modelling utilities but allow for three
     media metric matrices (impressions, clicks, conversions). For tacticals
-    where a metric is unavailable, provide ``availability`` so the data can be
-    backfilled from other metrics following ``fallback_order``.
+    where a metric is unavailable, provide ``availability`` to zero out the
+    corresponding columns instead of copying exposure from another metric.
     """
 
     priors = priors or Priors()
@@ -306,11 +614,13 @@ def ensemble(
         result.weight = float(weights[metric_name])
 
     contributions_weighted = _aggregate_contributions(per_model, weights)
+    uncertainty_weighted = _aggregate_uncertainty(per_model, weights)
 
     return EnsembleResult(
         per_model=per_model,
         weights=weights,
         contributions_weighted=contributions_weighted,
+        uncertainty_weighted=uncertainty_weighted,
     )
 
 
