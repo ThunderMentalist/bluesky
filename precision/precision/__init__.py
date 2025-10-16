@@ -3,7 +3,7 @@
 from .hierarchy import Hierarchy, build_hierarchy
 from .priors import Priors
 from .adstock import adstock_geometric_np, adstock_geometric_tf
-from .posterior import make_target_log_prob_fn
+from .posterior import ParamSpec, make_target_log_prob_fn
 from .sampling import PosteriorSamples, run_nuts
 from .summaries import (
     Contributions,
@@ -19,6 +19,7 @@ __all__ = [
     "Priors",
     "adstock_geometric_np",
     "adstock_geometric_tf",
+    "ParamSpec",
     "make_target_log_prob_fn",
     "PosteriorSamples",
     "run_nuts",

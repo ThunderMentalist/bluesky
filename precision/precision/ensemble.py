@@ -270,7 +270,7 @@ def _fit_single_metric_model(
 ) -> PerModelResult:
     """Fit a single metric-specific MMM and compute summary statistics."""
 
-    target_log_prob_fn, dims = make_target_log_prob_fn(
+    target_log_prob_fn, dims, param_spec = make_target_log_prob_fn(
         y=y,
         U_tactical=U,
         Z_controls=Z,
@@ -278,7 +278,7 @@ def _fit_single_metric_model(
         normalize_adstock=normalize_adstock,
         priors=priors,
     )
-    samples = run_nuts(target_log_prob_fn, dims, **nuts_args)
+    samples = run_nuts(target_log_prob_fn, dims, param_spec, **nuts_args)
     post_mean = posterior_mean(samples)
     decay_df = summarise_decay_rates(samples, hierarchy)
 
@@ -573,7 +573,7 @@ def ensemble(
     control_names: Optional[List[str]] = None,
     availability: Optional[Dict[MetricName, np.ndarray]] = None,
     fallback_order: Optional[List[MetricName]] = None,
-    normalize_adstock: bool = False,
+    normalize_adstock: bool = True,
     priors: Optional[Priors] = None,
     nuts_args: Optional[Dict] = None,
     weight_scheme: str = "stacking",

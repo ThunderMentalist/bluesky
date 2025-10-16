@@ -81,10 +81,14 @@ def compute_contributions_from_params(
     beta_channel: np.ndarray,
     gamma: np.ndarray,
     delta: np.ndarray,
-    normalize_adstock: bool = False,
+    normalize_adstock: bool = True,
     time_index: Optional[pd.Index] = None,
 ) -> Contributions:
-    """Compute contributions for a given parameter realisation."""
+    """Compute contributions for a given parameter realisation.
+
+    When ``normalize_adstock`` is ``True`` (default) the tactical signals are
+    adstocked using the normalized variant to align with model fitting.
+    """
 
     T, num_tacticals = U_tactical.shape
     num_controls = 0 if Z_controls is None else Z_controls.shape[1]
