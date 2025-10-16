@@ -45,6 +45,9 @@ class PosteriorSamples:
     tau0: np.ndarray | None = None
     lambda_local: np.ndarray | None = None
     s_sat: np.ndarray | None = None
+    eta_channel: np.ndarray | None = None
+    eta_platform: np.ndarray | None = None
+    eta_tactical: np.ndarray | None = None
 
     def stack_chains(self) -> "PosteriorSamples":
         """Return a copy with chain and sample dimensions flattened."""
@@ -73,6 +76,15 @@ class PosteriorSamples:
             if self.lambda_local is None
             else _stack_last_two(self.lambda_local),
             s_sat=None if self.s_sat is None else _stack_last_two(self.s_sat),
+            eta_channel=None
+            if self.eta_channel is None
+            else _stack_last_two(self.eta_channel),
+            eta_platform=None
+            if self.eta_platform is None
+            else _stack_last_two(self.eta_platform),
+            eta_tactical=None
+            if self.eta_tactical is None
+            else _stack_last_two(self.eta_tactical),
         )
 
 
@@ -159,8 +171,16 @@ def run_nuts(
     else:
         raise ValueError(f"Unknown mode {mode!r}")
 
-    beta_platform = name_to_tensor.get("beta_platform")
-    beta_tactical = name_to_tensor.get("beta_tactical")
+    eta_channel = name_to_tensor.get("eta_channel")
+    if eta_channel is None:
+        raise KeyError("eta_channel parameter missing from samples")
+    beta_channel = np.exp(eta_channel)
+
+    eta_platform = name_to_tensor.get("eta_platform")
+    beta_platform = None if eta_platform is None else np.exp(eta_platform)
+
+    eta_tactical = name_to_tensor.get("eta_tactical")
+    beta_tactical = None if eta_tactical is None else np.exp(eta_tactical)
     tau_beta = name_to_tensor.get("tau_beta")
     tau0 = name_to_tensor.get("tau0")
     lambda_local = name_to_tensor.get("lambda_local")
@@ -168,7 +188,7 @@ def run_nuts(
 
     return PosteriorSamples(
         beta0=name_to_tensor["beta0"],
-        beta_channel=name_to_tensor["beta_channel"],
+        beta_channel=beta_channel,
         gamma=name_to_tensor.get("gamma", np.zeros((num_samples, num_chains, 0))),
         delta=delta,
         sigma=name_to_tensor["sigma"],
@@ -182,6 +202,9 @@ def run_nuts(
         tau0=tau0,
         lambda_local=lambda_local,
         s_sat=s_sat,
+        eta_channel=eta_channel,
+        eta_platform=eta_platform,
+        eta_tactical=eta_tactical,
     )
 
 

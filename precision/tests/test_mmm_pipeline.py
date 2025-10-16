@@ -78,6 +78,11 @@ def test_mmm_pipeline_runs():
     )
 
     post = posterior_mean(samples)
+    tactical_scale = None
+    if "tactical_rescale" in dims:
+        tactical_scale = np.array(dims["tactical_rescale"], dtype=float)
+    beta0_offset = float(dims.get("y_mean", 0.0))
+
     contrib = compute_contributions_from_params(
         y=y,
         U_tactical=U_tactical,
@@ -90,6 +95,8 @@ def test_mmm_pipeline_runs():
         delta=post["delta"],
         beta_platform=post.get("beta_platform"),
         beta_tactical=post.get("beta_tactical"),
+        beta0_offset=beta0_offset,
+        tactical_scale=tactical_scale,
     )
 
     assert contrib.channel.shape == (T, hierarchy.num_channels)
