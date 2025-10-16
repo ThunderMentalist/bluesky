@@ -1,7 +1,14 @@
 """Precision MMM Bayesian MCMC package."""
 
 from .hierarchy import Hierarchy, build_hierarchy
-from .priors import BetaStructure, LikelihoodFamily, Priors, ResidualMode, SparsityPrior
+from .priors import (
+    BetaStructure,
+    LikelihoodFamily,
+    MediaStandardize,
+    Priors,
+    ResidualMode,
+    SparsityPrior,
+)
 from .adstock import adstock_geometric_np, adstock_geometric_tf
 from .posterior import ParamSpec, make_target_log_prob_fn
 from .sampling import PosteriorSamples, run_nuts
@@ -18,6 +25,7 @@ __all__ = [
     "Hierarchy",
     "build_hierarchy",
     "Priors",
+    "MediaStandardize",
     "BetaStructure",
     "SparsityPrior",
     "LikelihoodFamily",

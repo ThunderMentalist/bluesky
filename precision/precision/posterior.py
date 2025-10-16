@@ -12,6 +12,11 @@ import tensorflow_probability as tfp
 from .adstock import DTYPE, adstock_geometric_tf
 from .hierarchy import Hierarchy
 from .priors import Priors
+from .scaling import (
+    apply_pre_adstock_tactical,
+    center_y as _center_y,
+    fit_media_scales_pre_adstock_tactical,
+)
 
 
 tfd = tfp.distributions
@@ -51,9 +56,9 @@ def make_target_log_prob_fn(
 
     const = lambda value: tf.constant(value, dtype=DTYPE)
 
-    y_tf = tf.convert_to_tensor(y, dtype=DTYPE)
-    U_tf = tf.convert_to_tensor(U_tactical, dtype=DTYPE)
     T_, num_tacticals = U_tactical.shape
+    C = int(hierarchy.num_channels)
+    P = int(hierarchy.num_platforms)
 
     if Z_controls is None:
         Z_tf = tf.zeros((T_, 0), dtype=DTYPE)
@@ -62,9 +67,30 @@ def make_target_log_prob_fn(
         Z_tf = tf.convert_to_tensor(Z_controls, dtype=DTYPE)
         num_controls = int(Z_controls.shape[1])
 
-    C = int(hierarchy.num_channels)
-    P = int(hierarchy.num_platforms)
+    # Optional centring of the outcome for intercept interpretability.
+    if priors.center_y:
+        y_centered, y_mean = _center_y(y)
+    else:
+        y_centered, y_mean = y, 0.0
+    y_tf = tf.convert_to_tensor(y_centered, dtype=DTYPE)
 
+    # Optional standardisation of tactical inputs prior to adstocking.
+    scale_mode = priors.standardize_media
+    if scale_mode == "pre_adstock_tactical":
+        scale_vec = fit_media_scales_pre_adstock_tactical(
+            U_tactical, stat=priors.media_scale_stat
+        )
+        U_scaled = apply_pre_adstock_tactical(U_tactical, scale_vec)
+        tactical_rescale = 1.0 / scale_vec
+    elif scale_mode == "none":
+        U_scaled = U_tactical
+        tactical_rescale = np.ones(num_tacticals, dtype=float)
+    else:
+        raise ValueError(
+            "priors.standardize_media must be 'none' or 'pre_adstock_tactical'"
+        )
+
+    U_tf = tf.convert_to_tensor(U_scaled, dtype=DTYPE)
     M_tc_tf = tf.convert_to_tensor(hierarchy.M_tc, dtype=DTYPE)
     M_tp_tf = tf.convert_to_tensor(hierarchy.M_tp, dtype=DTYPE)
     t_to_p = tf.convert_to_tensor(hierarchy.t_to_p, dtype=tf.int32)
@@ -72,15 +98,6 @@ def make_target_log_prob_fn(
     t_to_c = tf.gather(p_to_c, t_to_p)
 
     prior_beta0 = tfd.Normal(loc=const(0.0), scale=const(priors.beta0_sd))
-    if priors.enforce_beta_positive:
-        beta_bij = tfb.Softplus()
-        prior_beta_ch = tfd.LogNormal(
-            loc=const(priors.beta_log_mu), scale=const(priors.beta_log_sd)
-        )
-    else:
-        beta_bij = tfb.Identity()
-        prior_beta_ch = tfd.Normal(loc=const(0.0), scale=const(priors.beta_sd))
-
     prior_gamma = (
         tfd.Normal(loc=const(0.0), scale=const(priors.gamma_sd))
         if num_controls > 0
@@ -92,34 +109,38 @@ def make_target_log_prob_fn(
         if priors.use_saturation
         else None
     )
+    prior_eta_channel = tfd.Normal(
+        loc=const(priors.lift_log_mu), scale=const(priors.lift_log_sd)
+    )
+    prior_tau = tfd.HalfNormal(scale=const(priors.beta_pool_sd))
 
     beta_structure = priors.beta_structure
     sparsity = priors.sparsity_prior
     if beta_structure not in {"channel", "platform_hier", "tactical_hier"}:
         raise ValueError(f"Unknown priors.beta_structure={beta_structure!r}")
-    if sparsity not in {"none", "horseshoe", "dl"}:
+    if sparsity not in {"none", "horseshoe"}:
         raise ValueError(f"Unknown priors.sparsity_prior={sparsity!r}")
-
     if beta_structure != "tactical_hier" and sparsity != "none":
         raise ValueError("Sparsity priors are only supported with tactical_hier betas")
-    if sparsity == "horseshoe" and beta_structure != "tactical_hier":
-        raise ValueError("Horseshoe prior requires tactical_hier beta structure")
 
     param_spec: List[ParamSpec] = []
     param_spec.append(ParamSpec("beta0", (), tfb.Identity(), tf.zeros([], DTYPE)))
     param_spec.append(
-        ParamSpec("beta_channel", (C,), beta_bij, tf.zeros([C], DTYPE))
-    )
-    param_spec.append(
         ParamSpec("gamma", (num_controls,), tfb.Identity(), tf.zeros([num_controls], DTYPE))
     )
-
     if priors.use_saturation:
         param_spec.append(
             ParamSpec("s_sat", (), tfb.Exp(), const(priors.sat_log_mu))
         )
+    param_spec.append(
+        ParamSpec(
+            "eta_channel",
+            (C,),
+            tfb.Identity(),
+            tf.fill([C], const(priors.lift_log_mu)),
+        )
+    )
 
-    # Beta hierarchy parameters.
     if beta_structure == "platform_hier":
         param_spec.append(
             ParamSpec(
@@ -130,7 +151,12 @@ def make_target_log_prob_fn(
             )
         )
         param_spec.append(
-            ParamSpec("beta_platform", (P,), tfb.Identity(), tf.zeros([P], DTYPE))
+            ParamSpec(
+                "eta_platform",
+                (P,),
+                tfb.Identity(),
+                tf.fill([P], const(priors.lift_log_mu)),
+            )
         )
     elif beta_structure == "tactical_hier":
         if sparsity != "horseshoe":
@@ -143,7 +169,12 @@ def make_target_log_prob_fn(
                 )
             )
         param_spec.append(
-            ParamSpec("beta_tactical", (num_tacticals,), tfb.Identity(), tf.zeros([num_tacticals], DTYPE))
+            ParamSpec(
+                "eta_tactical",
+                (num_tacticals,),
+                tfb.Identity(),
+                tf.fill([num_tacticals], const(priors.lift_log_mu)),
+            )
         )
         if sparsity == "horseshoe":
             param_spec.append(
@@ -163,7 +194,6 @@ def make_target_log_prob_fn(
                 )
             )
 
-    # Decay configuration.
     decay_specs: List[ParamSpec] = []
     decay_mode = priors.decay_mode
 
@@ -228,7 +258,7 @@ def make_target_log_prob_fn(
         )
 
         def delta_from_args(logit_delta: tf.Tensor, mu_c: tf.Tensor, log_tau_c: tf.Tensor) -> tf.Tensor:
-            del mu_c  # unused in reconstruction
+            del mu_c
             del log_tau_c
             return tf.math.sigmoid(logit_delta)
 
@@ -246,21 +276,15 @@ def make_target_log_prob_fn(
         raise ValueError(f"Unknown priors.decay_mode={decay_mode!r}")
 
     param_spec.extend(decay_specs)
-    sigma_spec = ParamSpec("sigma", (), tfb.Softplus(), const(1.0))
-    param_spec.append(sigma_spec)
+    param_spec.append(ParamSpec("sigma", (), tfb.Softplus(), const(1.0)))
 
     def _log_prior_common(
         beta0: tf.Tensor,
-        beta_channel: tf.Tensor,
         gamma: tf.Tensor,
         sigma: tf.Tensor,
         s_sat: Optional[tf.Tensor],
     ) -> tf.Tensor:
-        lp = (
-            prior_beta0.log_prob(beta0)
-            + tf.reduce_sum(prior_beta_ch.log_prob(beta_channel))
-            + prior_sigma.log_prob(sigma)
-        )
+        lp = prior_beta0.log_prob(beta0) + prior_sigma.log_prob(sigma)
         if num_controls > 0 and prior_gamma is not None:
             lp += tf.reduce_sum(prior_gamma.log_prob(gamma))
         if priors.use_saturation and prior_s_sat is not None and s_sat is not None:
@@ -271,8 +295,7 @@ def make_target_log_prob_fn(
     if like_family not in {"normal", "student_t"}:
         raise ValueError(f"Unknown priors.likelihood={like_family!r}")
 
-    resid_mode = priors.residual_mode
-    if resid_mode != "iid":
+    if priors.residual_mode != "iid":
         raise NotImplementedError("Only IID residuals are supported in this build")
 
     nu = const(priors.student_t_df)
@@ -302,16 +325,15 @@ def make_target_log_prob_fn(
             series = _saturate_log1p(series, s_param)
         return series
 
-    # Channel-only structure -------------------------------------------------
     if beta_structure == "channel":
 
         if priors.use_saturation:
 
             def target_log_prob(
                 beta0: tf.Tensor,
-                beta_channel: tf.Tensor,
                 gamma: tf.Tensor,
                 s_sat: tf.Tensor,
+                eta_channel: tf.Tensor,
                 *decay_and_sigma: tf.Tensor,
             ) -> tf.Tensor:
                 sigma = decay_and_sigma[-1]
@@ -319,8 +341,10 @@ def make_target_log_prob_fn(
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, s_sat)
                 channel_series = tf.linalg.matmul(tactical_series, M_tc_tf)
+                beta_channel = tf.exp(eta_channel)
                 ll = _log_likelihood(channel_series, beta_channel, beta0, gamma, sigma)
-                lp = _log_prior_common(beta0, beta_channel, gamma, sigma, s_sat)
+                lp = _log_prior_common(beta0, gamma, sigma, s_sat)
+                lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += log_prior_decay(*decay_args)
                 return ll + lp
 
@@ -328,8 +352,8 @@ def make_target_log_prob_fn(
 
             def target_log_prob(
                 beta0: tf.Tensor,
-                beta_channel: tf.Tensor,
                 gamma: tf.Tensor,
+                eta_channel: tf.Tensor,
                 *decay_and_sigma: tf.Tensor,
             ) -> tf.Tensor:
                 sigma = decay_and_sigma[-1]
@@ -337,8 +361,10 @@ def make_target_log_prob_fn(
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, None)
                 channel_series = tf.linalg.matmul(tactical_series, M_tc_tf)
+                beta_channel = tf.exp(eta_channel)
                 ll = _log_likelihood(channel_series, beta_channel, beta0, gamma, sigma)
-                lp = _log_prior_common(beta0, beta_channel, gamma, sigma, None)
+                lp = _log_prior_common(beta0, gamma, sigma, None)
+                lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += log_prior_decay(*decay_args)
                 return ll + lp
 
@@ -351,22 +377,22 @@ def make_target_log_prob_fn(
             "mode": decay_mode,
             "beta_structure": "channel",
             "use_saturation": priors.use_saturation,
+            "tactical_rescale": tactical_rescale.tolist(),
+            "y_mean": y_mean,
         }
         return target_log_prob, dims, param_spec
 
-    # Platform hierarchy -----------------------------------------------------
     if beta_structure == "platform_hier":
-        prior_tau = tfd.HalfNormal(scale=const(priors.beta_pool_sd))
 
         if priors.use_saturation:
 
             def target_log_prob(
                 beta0: tf.Tensor,
-                beta_channel: tf.Tensor,
                 gamma: tf.Tensor,
                 s_sat: tf.Tensor,
+                eta_channel: tf.Tensor,
                 tau_beta: tf.Tensor,
-                beta_platform: tf.Tensor,
+                eta_platform: tf.Tensor,
                 *decay_and_sigma: tf.Tensor,
             ) -> tf.Tensor:
                 sigma = decay_and_sigma[-1]
@@ -374,13 +400,15 @@ def make_target_log_prob_fn(
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, s_sat)
                 platform_series = tf.linalg.matmul(tactical_series, M_tp_tf)
+                beta_platform = tf.exp(eta_platform)
                 ll = _log_likelihood(platform_series, beta_platform, beta0, gamma, sigma)
 
-                beta_ch_for_p = tf.gather(beta_channel, p_to_c)
-                lp = _log_prior_common(beta0, beta_channel, gamma, sigma, s_sat)
+                eta_ch_for_p = tf.gather(eta_channel, p_to_c)
+                lp = _log_prior_common(beta0, gamma, sigma, s_sat)
+                lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += prior_tau.log_prob(tau_beta)
                 lp += tf.reduce_sum(
-                    tfd.Normal(loc=beta_ch_for_p, scale=tau_beta).log_prob(beta_platform)
+                    tfd.Normal(loc=eta_ch_for_p, scale=tau_beta).log_prob(eta_platform)
                 )
                 lp += log_prior_decay(*decay_args)
                 return ll + lp
@@ -389,10 +417,10 @@ def make_target_log_prob_fn(
 
             def target_log_prob(
                 beta0: tf.Tensor,
-                beta_channel: tf.Tensor,
                 gamma: tf.Tensor,
+                eta_channel: tf.Tensor,
                 tau_beta: tf.Tensor,
-                beta_platform: tf.Tensor,
+                eta_platform: tf.Tensor,
                 *decay_and_sigma: tf.Tensor,
             ) -> tf.Tensor:
                 sigma = decay_and_sigma[-1]
@@ -400,13 +428,15 @@ def make_target_log_prob_fn(
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, None)
                 platform_series = tf.linalg.matmul(tactical_series, M_tp_tf)
+                beta_platform = tf.exp(eta_platform)
                 ll = _log_likelihood(platform_series, beta_platform, beta0, gamma, sigma)
 
-                beta_ch_for_p = tf.gather(beta_channel, p_to_c)
-                lp = _log_prior_common(beta0, beta_channel, gamma, sigma, None)
+                eta_ch_for_p = tf.gather(eta_channel, p_to_c)
+                lp = _log_prior_common(beta0, gamma, sigma, None)
+                lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += prior_tau.log_prob(tau_beta)
                 lp += tf.reduce_sum(
-                    tfd.Normal(loc=beta_ch_for_p, scale=tau_beta).log_prob(beta_platform)
+                    tfd.Normal(loc=eta_ch_for_p, scale=tau_beta).log_prob(eta_platform)
                 )
                 lp += log_prior_decay(*decay_args)
                 return ll + lp
@@ -420,18 +450,18 @@ def make_target_log_prob_fn(
             "mode": decay_mode,
             "beta_structure": "platform_hier",
             "use_saturation": priors.use_saturation,
+            "tactical_rescale": tactical_rescale.tolist(),
+            "y_mean": y_mean,
         }
         return target_log_prob, dims, param_spec
 
-    # Tactical hierarchy -----------------------------------------------------
-    prior_tau = tfd.HalfNormal(scale=const(priors.beta_pool_sd))
     hs_global = const(priors.hs_global_scale)
     hs_slab_scale = const(priors.hs_slab_scale)
     hs_slab_df = const(priors.hs_slab_df)
     if priors.hs_slab_df > 2.0:
-        c2 = hs_slab_scale ** 2 * (hs_slab_df / (hs_slab_df - const(2.0)))
+        c2 = hs_slab_scale**2 * (hs_slab_df / (hs_slab_df - const(2.0)))
     else:
-        c2 = hs_slab_scale ** 2
+        c2 = hs_slab_scale**2
 
     if sparsity == "horseshoe":
         half_cauchy_global = tfd.HalfCauchy(scale=hs_global)
@@ -441,10 +471,10 @@ def make_target_log_prob_fn(
 
             def target_log_prob(
                 beta0: tf.Tensor,
-                beta_channel: tf.Tensor,
                 gamma: tf.Tensor,
                 s_sat: tf.Tensor,
-                beta_tactical: tf.Tensor,
+                eta_channel: tf.Tensor,
+                eta_tactical: tf.Tensor,
                 tau0: tf.Tensor,
                 lambda_local: tf.Tensor,
                 *decay_and_sigma: tf.Tensor,
@@ -453,16 +483,18 @@ def make_target_log_prob_fn(
                 decay_args = decay_and_sigma[:-1]
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, s_sat)
+                beta_tactical = tf.exp(eta_tactical)
                 ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-                beta_ch_for_t = tf.gather(beta_channel, t_to_c)
-                deviation = beta_tactical - beta_ch_for_t
-                lam2 = lambda_local ** 2
-                tau0_sq = tau0 ** 2
+                eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+                deviation = eta_tactical - eta_ch_for_t
+                lam2 = lambda_local**2
+                tau0_sq = tau0**2
                 shrink = (c2 * lam2) / (c2 + tau0_sq * lam2)
                 sd = tf.sqrt(tf.maximum(tau0_sq * shrink, const(1e-12)))
 
-                lp = _log_prior_common(beta0, beta_channel, gamma, sigma, s_sat)
+                lp = _log_prior_common(beta0, gamma, sigma, s_sat)
+                lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += tf.reduce_sum(tfd.Normal(loc=const(0.0), scale=sd).log_prob(deviation))
                 lp += half_cauchy_global.log_prob(tau0)
                 lp += tf.reduce_sum(half_cauchy_local.log_prob(lambda_local))
@@ -473,9 +505,9 @@ def make_target_log_prob_fn(
 
             def target_log_prob(
                 beta0: tf.Tensor,
-                beta_channel: tf.Tensor,
                 gamma: tf.Tensor,
-                beta_tactical: tf.Tensor,
+                eta_channel: tf.Tensor,
+                eta_tactical: tf.Tensor,
                 tau0: tf.Tensor,
                 lambda_local: tf.Tensor,
                 *decay_and_sigma: tf.Tensor,
@@ -484,16 +516,18 @@ def make_target_log_prob_fn(
                 decay_args = decay_and_sigma[:-1]
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, None)
+                beta_tactical = tf.exp(eta_tactical)
                 ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-                beta_ch_for_t = tf.gather(beta_channel, t_to_c)
-                deviation = beta_tactical - beta_ch_for_t
-                lam2 = lambda_local ** 2
-                tau0_sq = tau0 ** 2
+                eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+                deviation = eta_tactical - eta_ch_for_t
+                lam2 = lambda_local**2
+                tau0_sq = tau0**2
                 shrink = (c2 * lam2) / (c2 + tau0_sq * lam2)
                 sd = tf.sqrt(tf.maximum(tau0_sq * shrink, const(1e-12)))
 
-                lp = _log_prior_common(beta0, beta_channel, gamma, sigma, None)
+                lp = _log_prior_common(beta0, gamma, sigma, None)
+                lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += tf.reduce_sum(tfd.Normal(loc=const(0.0), scale=sd).log_prob(deviation))
                 lp += half_cauchy_global.log_prob(tau0)
                 lp += tf.reduce_sum(half_cauchy_local.log_prob(lambda_local))
@@ -510,33 +544,35 @@ def make_target_log_prob_fn(
             "beta_structure": "tactical_hier",
             "sparsity": "horseshoe",
             "use_saturation": priors.use_saturation,
+            "tactical_rescale": tactical_rescale.tolist(),
+            "y_mean": y_mean,
         }
         return target_log_prob, dims, param_spec
 
-    # Tactical hierarchy without sparsity -----------------------------------
     if priors.use_saturation:
 
         def target_log_prob(
             beta0: tf.Tensor,
-            beta_channel: tf.Tensor,
             gamma: tf.Tensor,
             s_sat: tf.Tensor,
+            eta_channel: tf.Tensor,
             tau_beta: tf.Tensor,
-            beta_tactical: tf.Tensor,
+            eta_tactical: tf.Tensor,
             *decay_and_sigma: tf.Tensor,
         ) -> tf.Tensor:
             sigma = decay_and_sigma[-1]
             decay_args = decay_and_sigma[:-1]
             delta = delta_from_args(*decay_args)
             tactical_series = _tactical_series(delta, s_sat)
+            beta_tactical = tf.exp(eta_tactical)
             ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-            beta_ch_for_t = tf.gather(beta_channel, t_to_c)
-            deviation = beta_tactical - beta_ch_for_t
-            lp = _log_prior_common(beta0, beta_channel, gamma, sigma, s_sat)
+            eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+            lp = _log_prior_common(beta0, gamma, sigma, s_sat)
+            lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
             lp += prior_tau.log_prob(tau_beta)
             lp += tf.reduce_sum(
-                tfd.Normal(loc=const(0.0), scale=tau_beta).log_prob(deviation)
+                tfd.Normal(loc=eta_ch_for_t, scale=tau_beta).log_prob(eta_tactical)
             )
             lp += log_prior_decay(*decay_args)
             return ll + lp
@@ -545,24 +581,25 @@ def make_target_log_prob_fn(
 
         def target_log_prob(
             beta0: tf.Tensor,
-            beta_channel: tf.Tensor,
             gamma: tf.Tensor,
+            eta_channel: tf.Tensor,
             tau_beta: tf.Tensor,
-            beta_tactical: tf.Tensor,
+            eta_tactical: tf.Tensor,
             *decay_and_sigma: tf.Tensor,
         ) -> tf.Tensor:
             sigma = decay_and_sigma[-1]
             decay_args = decay_and_sigma[:-1]
             delta = delta_from_args(*decay_args)
             tactical_series = _tactical_series(delta, None)
+            beta_tactical = tf.exp(eta_tactical)
             ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-            beta_ch_for_t = tf.gather(beta_channel, t_to_c)
-            deviation = beta_tactical - beta_ch_for_t
-            lp = _log_prior_common(beta0, beta_channel, gamma, sigma, None)
+            eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+            lp = _log_prior_common(beta0, gamma, sigma, None)
+            lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
             lp += prior_tau.log_prob(tau_beta)
             lp += tf.reduce_sum(
-                tfd.Normal(loc=const(0.0), scale=tau_beta).log_prob(deviation)
+                tfd.Normal(loc=eta_ch_for_t, scale=tau_beta).log_prob(eta_tactical)
             )
             lp += log_prior_decay(*decay_args)
             return ll + lp
@@ -577,6 +614,8 @@ def make_target_log_prob_fn(
         "beta_structure": "tactical_hier",
         "sparsity": "none",
         "use_saturation": priors.use_saturation,
+        "tactical_rescale": tactical_rescale.tolist(),
+        "y_mean": y_mean,
     }
     return target_log_prob, dims, param_spec
 

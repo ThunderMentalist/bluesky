@@ -11,7 +11,8 @@ DecayMode = Literal["beta", "half_life", "hier_logit"]
 LikelihoodFamily = Literal["normal", "student_t"]
 ResidualMode = Literal["iid", "ar1"]
 BetaStructure = Literal["channel", "platform_hier", "tactical_hier"]
-SparsityPrior = Literal["none", "horseshoe", "dl"]
+SparsityPrior = Literal["none", "horseshoe"]
+MediaStandardize = Literal["none", "pre_adstock_tactical"]
 
 
 @dataclass(frozen=True)
@@ -46,31 +47,34 @@ class Priors:
     residual_mode: ResidualMode = "iid"
     phi_prior_sd: float = 0.5
 
-    # Structure for beta coefficients and optional sparsity.
+    # ---- I: β structure & shrinkage ----
     beta_structure: BetaStructure = "platform_hier"
     sparsity_prior: SparsityPrior = "none"
-
-    # Hierarchical pooling / sparsity hyperparameters.
-    beta_pool_sd: float = 1.0
+    beta_pool_sd: float = 0.75
     hs_global_scale: float = 0.5
     hs_slab_scale: float = 1.0
     hs_slab_df: float = 4.0
+
+    # ---- J: interpretable lift priors (log-space) ----
+    lift_log_mu: float = float(np.log(0.1))
+    lift_log_sd: float = 1.0
+
+    # ---- J: scaling options ----
+    standardize_media: MediaStandardize = "pre_adstock_tactical"
+    media_scale_stat: Literal["median", "mean", "p95"] = "median"
+    center_y: bool = True
 
     # --- Saturation configuration ---
     use_saturation: bool = False
     sat_log_mu: float = float(np.log(10.0))
     sat_log_sd: float = 0.7
 
-    # --- Positive beta configuration ---
-    enforce_beta_positive: bool = True
-    beta_log_mu: float = float(np.log(0.1))
-    beta_log_sd: float = 1.0
-
 
 __all__ = [
     "BetaStructure",
     "DecayMode",
     "LikelihoodFamily",
+    "MediaStandardize",
     "ResidualMode",
     "Priors",
     "SparsityPrior",

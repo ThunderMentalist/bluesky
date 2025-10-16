@@ -47,6 +47,7 @@ def compute_contribution_arrays(
     normalize_adstock: bool,
     beta_platform: Optional[np.ndarray] = None,
     beta_tactical: Optional[np.ndarray] = None,
+    tactical_scale: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Single-draw contribution arrays (tactical/platform/channel/controls/intercept/fitted)."""
 
@@ -56,6 +57,7 @@ def compute_contribution_arrays(
         beta_channel=beta_channel,
         beta_platform=beta_platform,
         beta_tactical=beta_tactical,
+        tactical_scale=tactical_scale,
     )
     tactical = adstocked * beta_per_tactical[None, :]
     platform = tactical @ hierarchy.M_tp
@@ -138,6 +140,8 @@ def contributions_from_posterior(
     hierarchy: Hierarchy,
     control_names: Optional[list[str]] = None,
     normalize_adstock: bool = False,
+    beta0_offset: float = 0.0,
+    tactical_scale: Optional[np.ndarray] = None,
     ci: Tuple[float, float] = (0.05, 0.95),
     return_draws: bool = False,
 ) -> Tuple[Contributions, ContributionUncertainty, Optional[ContributionDraws]]:
@@ -171,13 +175,14 @@ def contributions_from_posterior(
             U_tactical,
             Z_controls,
             hierarchy,
-            beta0=float(stacked.beta0[d]),
+            beta0=float(stacked.beta0[d] + beta0_offset),
             beta_channel=beta_channel,
             gamma=gamma_d,
             delta=stacked.delta[d],
             normalize_adstock=normalize_adstock,
             beta_platform=beta_platform,
             beta_tactical=beta_tactical,
+            tactical_scale=tactical_scale,
         )
         tactical, platform, channel, controls_arr, intercept, fitted = arrays
         tactical_draws[d] = tactical
@@ -318,6 +323,9 @@ def posterior_mean(samples: PosteriorSamples) -> dict[str, np.ndarray | None]:
         "tau0": _mean(samples.tau0),
         "lambda_local": _mean(samples.lambda_local),
         "s_sat": _mean(samples.s_sat),
+        "eta_channel": _mean(samples.eta_channel),
+        "eta_platform": _mean(samples.eta_platform),
+        "eta_tactical": _mean(samples.eta_tactical),
     }
 
 
@@ -334,18 +342,27 @@ def beta_per_tactical_from_params(
     beta_channel: Optional[np.ndarray] = None,
     beta_platform: Optional[np.ndarray] = None,
     beta_tactical: Optional[np.ndarray] = None,
+    tactical_scale: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Return per-tactical coefficients regardless of modelling structure."""
 
     if beta_tactical is not None and beta_tactical.size > 0:
-        return np.asarray(beta_tactical, dtype=float)
-    if beta_platform is not None and beta_platform.size > 0:
-        return hierarchy.M_tp @ np.asarray(beta_platform, dtype=float)
-    if beta_channel is not None and beta_channel.size > 0:
-        return hierarchy.M_tc @ np.asarray(beta_channel, dtype=float)
-    raise ValueError(
-        "At least one of beta_channel, beta_platform, or beta_tactical must be provided."
-    )
+        beta = np.asarray(beta_tactical, dtype=float)
+    elif beta_platform is not None and beta_platform.size > 0:
+        beta = hierarchy.M_tp @ np.asarray(beta_platform, dtype=float)
+    elif beta_channel is not None and beta_channel.size > 0:
+        beta = hierarchy.M_tc @ np.asarray(beta_channel, dtype=float)
+    else:
+        raise ValueError(
+            "At least one of beta_channel, beta_platform, or beta_tactical must be provided."
+        )
+    if tactical_scale is not None:
+        scale = np.asarray(tactical_scale, dtype=float)
+        if scale.size not in (0, beta.size):
+            raise ValueError("tactical_scale must match tactical dimension or be None")
+        if scale.size == beta.size:
+            beta = beta * scale
+    return beta
 
 
 def summarise_decay_rates(
@@ -386,6 +403,8 @@ def compute_contributions_from_params(
     normalize_adstock: bool = True,
     time_index: Optional[pd.Index] = None,
     saturation_scale: Optional[float] = None,
+    beta0_offset: float = 0.0,
+    tactical_scale: Optional[np.ndarray] = None,
 ) -> Contributions:
     """Compute contributions for a given parameter realisation.
 
@@ -409,6 +428,7 @@ def compute_contributions_from_params(
         beta_channel=beta_channel,
         beta_platform=beta_platform,
         beta_tactical=beta_tactical,
+        tactical_scale=tactical_scale,
     )
     tactical_contrib = adstocked * beta_per_tactical[None, :]
     platform_contrib = tactical_contrib @ hierarchy.M_tp
@@ -426,7 +446,7 @@ def compute_contributions_from_params(
         if control_names is None:
             control_names = [f"control_{idx}" for idx in range(control_contrib.shape[1])]
 
-    intercept_contrib = np.full(T, float(beta0))
+    intercept_contrib = np.full(T, float(beta0) + float(beta0_offset))
     fitted = intercept_contrib + channel_contrib.sum(axis=1)
     if control_contrib.size > 0:
         fitted = fitted + control_contrib.sum(axis=1)
