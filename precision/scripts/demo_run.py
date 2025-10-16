@@ -87,6 +87,8 @@ def main(seed: int = 123) -> None:
         beta_channel=post["beta_channel"],
         gamma=post["gamma"],
         delta=post["delta"],
+        beta_platform=post.get("beta_platform"),
+        beta_tactical=post.get("beta_tactical"),
     )
     print("Channel totals:\n", contrib.channel_totals)
 

@@ -8,6 +8,8 @@ from typing import Literal
 import numpy as np
 
 DecayMode = Literal["beta", "half_life", "hier_logit"]
+BetaStructure = Literal["channel", "platform_hier", "tactical_hier"]
+SparsityPrior = Literal["none", "horseshoe", "dl"]
 
 
 @dataclass(frozen=True)
@@ -36,5 +38,20 @@ class Priors:
     hier_mu0_sd: float = 1.0
     hier_tau_sd: float = 0.5  # HalfNormal scale for tau_c
 
+    # Structure for beta coefficients and optional sparsity.
+    beta_structure: BetaStructure = "platform_hier"
+    sparsity_prior: SparsityPrior = "none"
 
-__all__ = ["DecayMode", "Priors"]
+    # Hierarchical pooling / sparsity hyperparameters.
+    beta_pool_sd: float = 1.0
+    hs_global_scale: float = 0.5
+    hs_slab_scale: float = 1.0
+    hs_slab_df: float = 4.0
+
+
+__all__ = [
+    "BetaStructure",
+    "DecayMode",
+    "Priors",
+    "SparsityPrior",
+]
