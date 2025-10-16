@@ -3,52 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
-from .adstock import adstock_geometric_np
 from .hierarchy import Hierarchy
 from .posterior import make_target_log_prob_fn
 from .priors import Priors
 from .sampling import PosteriorSamples, run_nuts
 from .summaries import (
+    ContributionInterval,
+    ContributionIntervalSeries,
+    ContributionUncertainty,
     Contributions,
-    beta_per_tactical_from_params,
+    compute_contribution_arrays,
+    _summarise_draws,
+    _summarise_draws_series,
     posterior_mean,
     summarise_decay_rates,
 )
 
 MetricName = str
-
-
-@dataclass
-class ContributionInterval:
-    """Lower and upper credible interval bounds for a contribution table."""
-
-    lower: pd.DataFrame
-    upper: pd.DataFrame
-
-
-@dataclass
-class ContributionIntervalSeries:
-    """Lower and upper credible interval bounds for a contribution series."""
-
-    lower: pd.Series
-    upper: pd.Series
-
-
-@dataclass
-class ContributionUncertainty:
-    """Posterior interval summaries for contributions at multiple levels."""
-
-    tactical: ContributionInterval
-    platform: ContributionInterval
-    channel: ContributionInterval
-    controls: ContributionInterval
-    intercept: ContributionIntervalSeries
-    fitted: ContributionIntervalSeries
 
 
 @dataclass
@@ -143,49 +119,6 @@ def _get_control_names(control_names: Optional[List[str]], num_controls: int) ->
     return list(control_names)
 
 
-def _compute_contribution_arrays(
-    U: np.ndarray,
-    Z: Optional[np.ndarray],
-    hierarchy: Hierarchy,
-    *,
-    beta0: float,
-    beta_channel: Optional[np.ndarray],
-    gamma: np.ndarray,
-    delta: np.ndarray,
-    beta_platform: Optional[np.ndarray],
-    beta_tactical: Optional[np.ndarray],
-    normalize_adstock: bool,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute contribution arrays for a single parameter draw."""
-
-    adstocked = adstock_geometric_np(U, delta, normalize=normalize_adstock)
-    beta_per_tactical = beta_per_tactical_from_params(
-        hierarchy,
-        beta_channel=beta_channel,
-        beta_platform=beta_platform,
-        beta_tactical=beta_tactical,
-    )
-    tactical = adstocked * beta_per_tactical[None, :]
-    platform = tactical @ hierarchy.M_tp
-    channel = tactical @ hierarchy.M_tc
-
-    if Z is None or gamma.size == 0:
-        control = np.zeros((U.shape[0], 0))
-    else:
-        gamma = np.atleast_1d(gamma)
-        if gamma.ndim == 1:
-            control = Z * gamma[None, :]
-        else:
-            control = Z @ gamma
-
-    intercept = np.full(U.shape[0], float(beta0))
-    fitted = intercept + channel.sum(axis=1)
-    if control.size > 0:
-        fitted = fitted + control.sum(axis=1)
-
-    return tactical, platform, channel, control, intercept, fitted
-
-
 def _arrays_to_dataframe(
     values: np.ndarray,
     index: pd.Index,
@@ -235,35 +168,6 @@ def _make_contributions_from_arrays(
     )
 
 
-def _summarise_draws(
-    draws: np.ndarray,
-    index: pd.Index,
-    columns: List[str],
-    *,
-    lower: float = 0.05,
-    upper: float = 0.95,
-) -> ContributionInterval:
-    if draws.size == 0:
-        empty = pd.DataFrame(index=index, columns=columns, dtype=float)
-        return ContributionInterval(lower=empty.copy(), upper=empty.copy())
-    lower_df = pd.DataFrame(np.quantile(draws, lower, axis=0), index=index, columns=columns)
-    upper_df = pd.DataFrame(np.quantile(draws, upper, axis=0), index=index, columns=columns)
-    return ContributionInterval(lower=lower_df, upper=upper_df)
-
-
-def _summarise_draws_series(
-    draws: np.ndarray,
-    index: pd.Index,
-    name: str,
-    *,
-    lower: float = 0.05,
-    upper: float = 0.95,
-) -> ContributionIntervalSeries:
-    lower_series = pd.Series(np.quantile(draws, lower, axis=0), index=index, name=name)
-    upper_series = pd.Series(np.quantile(draws, upper, axis=0), index=index, name=name)
-    return ContributionIntervalSeries(lower=lower_series, upper=upper_series)
-
-
 def _fit_single_metric_model(
     metric: MetricName,
     y: np.ndarray,
@@ -308,23 +212,23 @@ def _fit_single_metric_model(
     log_likelihood_draws = np.zeros((num_draws, T))
 
     for idx in range(num_draws):
-        tactical, platform, channel, controls_arr, intercept, fitted = _compute_contribution_arrays(
+        beta_channel = stacked.beta_channel[idx] if stacked.beta_channel.size > 0 else None
+        beta_platform = None if stacked.beta_platform is None else stacked.beta_platform[idx]
+        beta_tactical = None if stacked.beta_tactical is None else stacked.beta_tactical[idx]
+        gamma_draw = None
+        if stacked.gamma is not None and stacked.gamma.size > 0:
+            gamma_draw = stacked.gamma[idx]
+        tactical, platform, channel, controls_arr, intercept, fitted = compute_contribution_arrays(
             U,
             Z,
             hierarchy,
             beta0=float(stacked.beta0[idx]),
-            beta_channel=stacked.beta_channel[idx]
-            if stacked.beta_channel.size > 0
-            else None,
-            gamma=stacked.gamma[idx] if stacked.gamma.size > 0 else np.zeros((num_controls,)),
+            beta_channel=beta_channel,
+            gamma=gamma_draw,
             delta=stacked.delta[idx],
-            beta_platform=None
-            if stacked.beta_platform is None
-            else stacked.beta_platform[idx],
-            beta_tactical=None
-            if stacked.beta_tactical is None
-            else stacked.beta_tactical[idx],
             normalize_adstock=normalize_adstock,
+            beta_platform=beta_platform,
+            beta_tactical=beta_tactical,
         )
 
         tactical_draws[idx] = tactical
