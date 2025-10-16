@@ -26,7 +26,7 @@ def adstock_geometric_tf(
     """
 
     U_tactical = tf.convert_to_tensor(U_tactical, dtype=DTYPE)
-    delta = tf.convert_to_tensor(delta, dtype=DTYPE)
+    delta = tf.reshape(tf.convert_to_tensor(delta, dtype=DTYPE), [-1])
 
     def step(previous: tf.Tensor, current: tf.Tensor) -> tf.Tensor:
         return current + delta * previous

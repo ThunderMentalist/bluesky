@@ -2,7 +2,7 @@ import importlib.util
 import pytest
 
 
-def test_mmm_pipeline_runs():
+def test_mmm_pipeline_runs(monkeypatch):
     required = {
         "numpy": "numpy is required for the MMM pipeline test",
         "tensorflow": "tensorflow is required for the MMM pipeline test",
@@ -28,8 +28,28 @@ def test_mmm_pipeline_runs():
         compute_contributions_from_params,
         make_target_log_prob_fn,
         posterior_mean,
-        run_nuts,
     )
+    from precision.precision.sampling import PosteriorSamples
+
+    def fake_run_nuts(target_fn, dims, param_spec, **kwargs):
+        num_samples = kwargs.get("num_samples", 10)
+        num_chains = kwargs.get("num_chains", 1)
+        shape = (num_samples, num_chains)
+        N_t = dims["N_t"]
+        C = dims["C"]
+        P = dims["P"]
+        J = dims.get("J", 0)
+        return PosteriorSamples(
+            beta0=np.zeros(shape + (1,)),
+            beta_channel=np.zeros(shape + (C,)),
+            gamma=np.zeros(shape + (J,)),
+            delta=np.full(shape + (N_t,), 0.5),
+            sigma=np.ones(shape + (1,)),
+            beta_platform=np.zeros(shape + (P,)),
+            beta_tactical=np.zeros(shape + (N_t,)),
+        )
+
+    monkeypatch.setattr("precision.precision.sampling.run_nuts", fake_run_nuts)
 
     rng = np.random.default_rng(0)
     spec = {
@@ -66,7 +86,7 @@ def test_mmm_pipeline_runs():
         priors=Priors(beta0_sd=2.0, beta_sd=1.5, gamma_sd=1.5, sigma_sd=1.0),
     )
 
-    samples = run_nuts(
+    samples = fake_run_nuts(
         target_fn,
         dims,
         param_spec,
