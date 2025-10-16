@@ -7,61 +7,51 @@ import pandas as pd
 
 
 def fourier_seasonality(
-    length: int,
+    T: int,
     *,
     period: int = 52,
-    harmonics: int = 3,
+    K: int = 3,
     index: pd.Index | None = None,
 ) -> pd.DataFrame:
-    """Return a DataFrame of Fourier seasonal harmonics.
+    """Return a DataFrame of sine/cosine Fourier harmonics."""
 
-    Parameters
-    ----------
-    length:
-        Number of rows (typically the number of time periods).
-    period:
-        Seasonality period (e.g. ``52`` for weekly data with yearly seasonality).
-    harmonics:
-        Number of sine/cosine pairs to include.
-    index:
-        Optional index to attach to the returned DataFrame.
-    """
-
-    t = np.arange(length)
-    data: dict[str, np.ndarray] = {}
-    for k in range(1, harmonics + 1):
+    t = np.arange(T)
+    cols: dict[str, np.ndarray] = {}
+    for k in range(1, K + 1):
         angle = 2.0 * np.pi * k * t / period
-        data[f"sin_{period}_{k}"] = np.sin(angle)
-        data[f"cos_{period}_{k}"] = np.cos(angle)
-    idx = index if index is not None else pd.RangeIndex(length, name="time")
-    return pd.DataFrame(data, index=idx)
+        cols[f"sin_{period}_{k}"] = np.sin(angle)
+        cols[f"cos_{period}_{k}"] = np.cos(angle)
+    idx = index if index is not None else pd.RangeIndex(T, name="time")
+    return pd.DataFrame(cols, index=idx)
 
 
-def flag_weeks(
-    length: int,
-    flags: dict[str, list[int]],
-    *,
-    index: pd.Index | None = None,
-) -> pd.DataFrame:
-    """Construct indicator columns for holiday, promotion, or custom events."""
+def holiday_flags(index: pd.Index, spans: dict[str, list[int]]) -> pd.DataFrame:
+    """Construct indicator columns for holiday, promotion, or custom spans."""
 
-    idx = index if index is not None else pd.RangeIndex(length, name="time")
-    frame = pd.DataFrame(0, index=idx, columns=sorted(flags.keys()), dtype=float)
-    for name, weeks in flags.items():
-        valid = [week for week in weeks if 0 <= week < length]
-        frame.loc[idx[valid], name] = 1.0
+    frame = pd.DataFrame(0.0, index=index, columns=sorted(spans.keys()))
+    n = len(index)
+    for name, weeks in spans.items():
+        valid = [w for w in weeks if 0 <= w < n]
+        if valid:
+            frame.loc[index[valid], name] = 1.0
     return frame
 
 
-def stack_controls(*frames: pd.DataFrame) -> np.ndarray:
-    """Column-stack multiple control DataFrames into a design matrix."""
+def stack_controls(*frames: pd.DataFrame, standardize: bool = True) -> np.ndarray:
+    """Column-stack aligned frames and optionally z-score columns."""
 
     frames = [frame for frame in frames if frame is not None and not frame.empty]
     if not frames:
         return np.zeros((0, 0), dtype=float)
-    base_index = frames[0].index
-    aligned = [frame.reindex(base_index).fillna(0.0) for frame in frames]
-    return np.column_stack([frame.to_numpy() for frame in aligned])
+    base = frames[0].index
+    aligned = [frame.reindex(base).fillna(0.0) for frame in frames]
+    X = np.column_stack([a.to_numpy() for a in aligned])
+    if standardize and X.size:
+        mu = X.mean(axis=0, keepdims=True)
+        sd = X.std(axis=0, ddof=0, keepdims=True)
+        sd = np.where(sd <= 1e-9, 1.0, sd)
+        X = (X - mu) / sd
+    return X
 
 
-__all__ = ["fourier_seasonality", "flag_weeks", "stack_controls"]
+__all__ = ["fourier_seasonality", "holiday_flags", "stack_controls"]

@@ -9,6 +9,8 @@ __all__ = [
     "Priors",
     "BetaStructure",
     "SparsityPrior",
+    "LikelihoodFamily",
+    "ResidualMode",
     "adstock_geometric_np",
     "adstock_geometric_tf",
     "ParamSpec",
@@ -20,7 +22,7 @@ __all__ = [
     "posterior_mean",
     "summarise_decay_rates",
     "fourier_seasonality",
-    "flag_weeks",
+    "holiday_flags",
     "stack_controls",
 ]
 

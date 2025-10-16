@@ -8,6 +8,8 @@ from typing import Literal
 import numpy as np
 
 DecayMode = Literal["beta", "half_life", "hier_logit"]
+LikelihoodFamily = Literal["normal", "student_t"]
+ResidualMode = Literal["iid", "ar1"]
 BetaStructure = Literal["channel", "platform_hier", "tactical_hier"]
 SparsityPrior = Literal["none", "horseshoe", "dl"]
 
@@ -38,6 +40,12 @@ class Priors:
     hier_mu0_sd: float = 1.0
     hier_tau_sd: float = 0.5  # HalfNormal scale for tau_c
 
+    # Likelihood / residual configuration.
+    likelihood: LikelihoodFamily = "normal"
+    student_t_df: float = 5.0
+    residual_mode: ResidualMode = "iid"
+    phi_prior_sd: float = 0.5
+
     # Structure for beta coefficients and optional sparsity.
     beta_structure: BetaStructure = "platform_hier"
     sparsity_prior: SparsityPrior = "none"
@@ -48,10 +56,22 @@ class Priors:
     hs_slab_scale: float = 1.0
     hs_slab_df: float = 4.0
 
+    # --- Saturation configuration ---
+    use_saturation: bool = False
+    sat_log_mu: float = float(np.log(10.0))
+    sat_log_sd: float = 0.7
+
+    # --- Positive beta configuration ---
+    enforce_beta_positive: bool = True
+    beta_log_mu: float = float(np.log(0.1))
+    beta_log_sd: float = 1.0
+
 
 __all__ = [
     "BetaStructure",
     "DecayMode",
+    "LikelihoodFamily",
+    "ResidualMode",
     "Priors",
     "SparsityPrior",
 ]
