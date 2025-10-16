@@ -54,7 +54,7 @@ def main(seed: int = 123) -> None:
     mean = 1.0 + channel_signal.sum(axis=1) + Z_controls @ gamma_true
     y = mean + rng.normal(scale=1.0, size=T)
 
-    target_fn, dims = make_target_log_prob_fn(
+    target_fn, dims, param_spec = make_target_log_prob_fn(
         y=y,
         U_tactical=U_tactical,
         Z_controls=Z_controls,
@@ -65,6 +65,7 @@ def main(seed: int = 123) -> None:
     samples = run_nuts(
         target_fn,
         dims,
+        param_spec,
         num_chains=2,
         num_burnin=200,
         num_samples=200,
@@ -93,7 +94,7 @@ def main(seed: int = 123) -> None:
 def compute_adstock_np(U_tactical: np.ndarray, delta: np.ndarray) -> np.ndarray:
     from precision.adstock import adstock_geometric_np
 
-    return adstock_geometric_np(U_tactical, delta)
+    return adstock_geometric_np(U_tactical, delta, normalize=True)
 
 
 if __name__ == "__main__":

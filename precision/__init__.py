@@ -9,6 +9,7 @@ __all__ = [
     "Priors",
     "adstock_geometric_np",
     "adstock_geometric_tf",
+    "ParamSpec",
     "make_target_log_prob_fn",
     "PosteriorSamples",
     "run_nuts",

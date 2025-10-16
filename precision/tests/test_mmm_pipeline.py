@@ -55,7 +55,7 @@ def test_mmm_pipeline_runs():
     mean = 0.8 + channel_signal.sum(axis=1) + Z_controls[:, 0] * gamma_true[0]
     y = mean + rng.normal(scale=0.5, size=T)
 
-    target_fn, dims = make_target_log_prob_fn(
+    target_fn, dims, param_spec = make_target_log_prob_fn(
         y=y,
         U_tactical=U_tactical,
         Z_controls=Z_controls,
@@ -66,6 +66,7 @@ def test_mmm_pipeline_runs():
     samples = run_nuts(
         target_fn,
         dims,
+        param_spec,
         num_chains=1,
         num_burnin=10,
         num_samples=15,
