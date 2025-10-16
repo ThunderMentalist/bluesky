@@ -31,10 +31,12 @@ class Contributions:
     fitted_total: float
 
 
-def posterior_mean(samples: PosteriorSamples) -> dict[str, np.ndarray]:
+def posterior_mean(samples: PosteriorSamples) -> dict[str, np.ndarray | None]:
     """Compute posterior means for each parameter."""
 
-    def _mean(array: np.ndarray) -> np.ndarray:
+    def _mean(array: np.ndarray | None) -> np.ndarray | None:
+        if array is None:
+            return None
         if array.size == 0:
             return array
         return np.mean(array, axis=(0, 1))
@@ -45,7 +47,32 @@ def posterior_mean(samples: PosteriorSamples) -> dict[str, np.ndarray]:
         "gamma": _mean(samples.gamma),
         "delta": _mean(samples.delta),
         "sigma": _mean(samples.sigma),
+        "beta_platform": _mean(samples.beta_platform),
+        "beta_tactical": _mean(samples.beta_tactical),
+        "tau_beta": _mean(samples.tau_beta),
+        "tau0": _mean(samples.tau0),
+        "lambda_local": _mean(samples.lambda_local),
     }
+
+
+def beta_per_tactical_from_params(
+    hierarchy: Hierarchy,
+    *,
+    beta_channel: Optional[np.ndarray] = None,
+    beta_platform: Optional[np.ndarray] = None,
+    beta_tactical: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Return per-tactical coefficients regardless of modelling structure."""
+
+    if beta_tactical is not None and beta_tactical.size > 0:
+        return np.asarray(beta_tactical, dtype=float)
+    if beta_platform is not None and beta_platform.size > 0:
+        return hierarchy.M_tp @ np.asarray(beta_platform, dtype=float)
+    if beta_channel is not None and beta_channel.size > 0:
+        return hierarchy.M_tc @ np.asarray(beta_channel, dtype=float)
+    raise ValueError(
+        "At least one of beta_channel, beta_platform, or beta_tactical must be provided."
+    )
 
 
 def summarise_decay_rates(
@@ -78,9 +105,11 @@ def compute_contributions_from_params(
     hierarchy: Hierarchy,
     *,
     beta0: np.ndarray,
-    beta_channel: np.ndarray,
+    beta_channel: Optional[np.ndarray] = None,
     gamma: np.ndarray,
     delta: np.ndarray,
+    beta_platform: Optional[np.ndarray] = None,
+    beta_tactical: Optional[np.ndarray] = None,
     normalize_adstock: bool = True,
     time_index: Optional[pd.Index] = None,
 ) -> Contributions:
@@ -97,7 +126,12 @@ def compute_contributions_from_params(
         time_index = pd.RangeIndex(T, name="time")
 
     adstocked = adstock_geometric_np(U_tactical, delta, normalize=normalize_adstock)
-    beta_per_tactical = hierarchy.M_tc @ beta_channel
+    beta_per_tactical = beta_per_tactical_from_params(
+        hierarchy,
+        beta_channel=beta_channel,
+        beta_platform=beta_platform,
+        beta_tactical=beta_tactical,
+    )
     tactical_contrib = adstocked * beta_per_tactical[None, :]
     platform_contrib = tactical_contrib @ hierarchy.M_tp
     channel_contrib = tactical_contrib @ hierarchy.M_tc
@@ -147,4 +181,5 @@ __all__ = [
     "posterior_mean",
     "summarise_decay_rates",
     "compute_contributions_from_params",
+    "beta_per_tactical_from_params",
 ]

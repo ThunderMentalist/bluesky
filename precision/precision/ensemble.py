@@ -15,6 +15,7 @@ from .priors import Priors
 from .sampling import PosteriorSamples, run_nuts
 from .summaries import (
     Contributions,
+    beta_per_tactical_from_params,
     posterior_mean,
     summarise_decay_rates,
 )
@@ -148,15 +149,22 @@ def _compute_contribution_arrays(
     hierarchy: Hierarchy,
     *,
     beta0: float,
-    beta_channel: np.ndarray,
+    beta_channel: Optional[np.ndarray],
     gamma: np.ndarray,
     delta: np.ndarray,
+    beta_platform: Optional[np.ndarray],
+    beta_tactical: Optional[np.ndarray],
     normalize_adstock: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute contribution arrays for a single parameter draw."""
 
     adstocked = adstock_geometric_np(U, delta, normalize=normalize_adstock)
-    beta_per_tactical = hierarchy.M_tc @ beta_channel
+    beta_per_tactical = beta_per_tactical_from_params(
+        hierarchy,
+        beta_channel=beta_channel,
+        beta_platform=beta_platform,
+        beta_tactical=beta_tactical,
+    )
     tactical = adstocked * beta_per_tactical[None, :]
     platform = tactical @ hierarchy.M_tp
     channel = tactical @ hierarchy.M_tc
@@ -305,9 +313,17 @@ def _fit_single_metric_model(
             Z,
             hierarchy,
             beta0=float(stacked.beta0[idx]),
-            beta_channel=stacked.beta_channel[idx],
+            beta_channel=stacked.beta_channel[idx]
+            if stacked.beta_channel.size > 0
+            else None,
             gamma=stacked.gamma[idx] if stacked.gamma.size > 0 else np.zeros((num_controls,)),
             delta=stacked.delta[idx],
+            beta_platform=None
+            if stacked.beta_platform is None
+            else stacked.beta_platform[idx],
+            beta_tactical=None
+            if stacked.beta_tactical is None
+            else stacked.beta_tactical[idx],
             normalize_adstock=normalize_adstock,
         )
 

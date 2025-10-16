@@ -39,6 +39,11 @@ class PosteriorSamples:
     logit_delta: np.ndarray | None = None
     mu_c: np.ndarray | None = None
     tau_c: np.ndarray | None = None
+    beta_platform: np.ndarray | None = None
+    beta_tactical: np.ndarray | None = None
+    tau_beta: np.ndarray | None = None
+    tau0: np.ndarray | None = None
+    lambda_local: np.ndarray | None = None
 
     def stack_chains(self) -> "PosteriorSamples":
         """Return a copy with chain and sample dimensions flattened."""
@@ -55,6 +60,17 @@ class PosteriorSamples:
             else _stack_last_two(self.logit_delta),
             mu_c=None if self.mu_c is None else _stack_last_two(self.mu_c),
             tau_c=None if self.tau_c is None else _stack_last_two(self.tau_c),
+            beta_platform=None
+            if self.beta_platform is None
+            else _stack_last_two(self.beta_platform),
+            beta_tactical=None
+            if self.beta_tactical is None
+            else _stack_last_two(self.beta_tactical),
+            tau_beta=None if self.tau_beta is None else _stack_last_two(self.tau_beta),
+            tau0=None if self.tau0 is None else _stack_last_two(self.tau0),
+            lambda_local=None
+            if self.lambda_local is None
+            else _stack_last_two(self.lambda_local),
         )
 
 
@@ -141,13 +157,27 @@ def run_nuts(
     else:
         raise ValueError(f"Unknown mode {mode!r}")
 
+    beta_platform = name_to_tensor.get("beta_platform")
+    beta_tactical = name_to_tensor.get("beta_tactical")
+    tau_beta = name_to_tensor.get("tau_beta")
+    tau0 = name_to_tensor.get("tau0")
+    lambda_local = name_to_tensor.get("lambda_local")
+
     return PosteriorSamples(
         beta0=name_to_tensor["beta0"],
         beta_channel=name_to_tensor["beta_channel"],
         gamma=name_to_tensor.get("gamma", np.zeros((num_samples, num_chains, 0))),
         delta=delta,
         sigma=name_to_tensor["sigma"],
-        **extras,
+        half_life=extras.get("half_life"),
+        logit_delta=extras.get("logit_delta"),
+        mu_c=extras.get("mu_c"),
+        tau_c=extras.get("tau_c"),
+        beta_platform=beta_platform,
+        beta_tactical=beta_tactical,
+        tau_beta=tau_beta,
+        tau0=tau0,
+        lambda_local=lambda_local,
     )
 
 

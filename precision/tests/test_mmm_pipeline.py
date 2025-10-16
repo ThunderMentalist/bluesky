@@ -17,7 +17,10 @@ def test_mmm_pipeline_runs():
 
     import numpy as np  # type: ignore[import-untyped]
     import tensorflow as tf  # noqa: F401
-    import tensorflow_probability as tfp  # noqa: F401
+    try:
+        import tensorflow_probability as tfp  # noqa: F401  # type: ignore[import-untyped]
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+        pytest.skip(f"tensorflow_probability unavailable: {exc}")
 
     from precision import (
         Priors,
@@ -85,9 +88,102 @@ def test_mmm_pipeline_runs():
         beta_channel=post["beta_channel"],
         gamma=post["gamma"],
         delta=post["delta"],
+        beta_platform=post.get("beta_platform"),
+        beta_tactical=post.get("beta_tactical"),
     )
 
     assert contrib.channel.shape == (T, hierarchy.num_channels)
     assert np.isfinite(post["beta0"]).all()
     assert np.isfinite(post["beta_channel"]).all()
     assert np.isfinite(post["delta"]).all()
+
+
+def test_beta_per_tactical_helper_priority():
+    import numpy as np  # type: ignore[import-untyped]
+
+    try:
+        from precision import build_hierarchy
+        from precision.precision.summaries import beta_per_tactical_from_params
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+        pytest.skip(f"precision package unavailable due to dependency error: {exc}")
+
+    hierarchy = build_hierarchy({"c1": {"p1": ["t1", "t2"], "p2": ["t3"]}})
+
+    beta_channel = np.array([1.0], dtype=float)
+    expected_channel = hierarchy.M_tc @ beta_channel
+    np.testing.assert_allclose(
+        beta_per_tactical_from_params(hierarchy, beta_channel=beta_channel),
+        expected_channel,
+    )
+
+    beta_platform = np.array([0.5, 0.8], dtype=float)
+    expected_platform = hierarchy.M_tp @ beta_platform
+    np.testing.assert_allclose(
+        beta_per_tactical_from_params(
+            hierarchy, beta_channel=beta_channel, beta_platform=beta_platform
+        ),
+        expected_platform,
+    )
+
+    beta_tactical = np.array([0.1, 0.2, 0.3], dtype=float)
+    np.testing.assert_allclose(
+        beta_per_tactical_from_params(
+            hierarchy,
+            beta_channel=beta_channel,
+            beta_platform=beta_platform,
+            beta_tactical=beta_tactical,
+        ),
+        beta_tactical,
+    )
+
+
+@pytest.mark.parametrize(
+    "beta_structure,sparsity",
+    [
+        ("channel", "none"),
+        ("platform_hier", "none"),
+        ("tactical_hier", "none"),
+        ("tactical_hier", "horseshoe"),
+    ],
+)
+def test_make_target_log_prob_fn_beta_structures_smoke(beta_structure: str, sparsity: str):
+    required = {
+        "numpy": "numpy is required for the beta structure smoke test",
+        "tensorflow": "tensorflow is required for the beta structure smoke test",
+        "tensorflow_probability": "tensorflow_probability is required for the beta structure smoke test",
+    }
+
+    missing = [name for name in required if importlib.util.find_spec(name) is None]
+    if missing:
+        pytest.skip(
+            ", ".join(required[name] for name in missing),
+        )
+
+    import numpy as np  # type: ignore[import-untyped]
+    import tensorflow as tf  # type: ignore[import-untyped]
+
+    try:
+        from precision import Priors, build_hierarchy, make_target_log_prob_fn
+    except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
+        pytest.skip(f"precision package unavailable due to dependency error: {exc}")
+
+    spec = {"c1": {"p1": ["t1", "t2"], "p2": ["t3"]}}
+    hierarchy = build_hierarchy(spec)
+    T = 5
+    N_t = hierarchy.num_tacticals
+    y = np.zeros(T, dtype=float)
+    U = np.ones((T, N_t), dtype=float)
+
+    priors = Priors(beta_structure=beta_structure, sparsity_prior=sparsity)
+    target_fn, _dims, param_spec = make_target_log_prob_fn(
+        y=y,
+        U_tactical=U,
+        Z_controls=None,
+        hierarchy=hierarchy,
+        priors=priors,
+    )
+
+    params = [tf.convert_to_tensor(p.init) for p in param_spec]
+    value = target_fn(*params)
+    assert value.shape == ()
+    assert tf.math.is_finite(value)
