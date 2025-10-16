@@ -63,13 +63,13 @@ The behaviour when spend is zero can be asserted with pytest as follows::
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 
 from .hierarchy import Hierarchy
-from .summaries import Contributions
+from .summaries import ContributionDraws, Contributions
 
 Definition = Literal["roas", "roi"]
 ZeroHandling = Literal["nan", "inf", "zero"]
@@ -107,6 +107,36 @@ class ROIResult:
     channel_ts: Optional[pd.DataFrame]
     definition: Definition
     window: pd.Index
+
+
+@dataclass
+class ROIInterval:
+    lower: pd.Series
+    upper: pd.Series
+
+
+@dataclass
+class ROIIntervalTS:
+    lower: pd.DataFrame
+    upper: pd.DataFrame
+
+
+@dataclass
+class ROIUncertainty:
+    tactical: ROIInterval
+    platform: ROIInterval
+    channel: ROIInterval
+    tactical_ts: Optional[ROIIntervalTS]
+    platform_ts: Optional[ROIIntervalTS]
+    channel_ts: Optional[ROIIntervalTS]
+
+
+def _quantile_series(values: np.ndarray, index: pd.Index, q: float, name: str) -> pd.Series:
+    return pd.Series(np.quantile(values, q, axis=0), index=index, name=name)
+
+
+def _quantile_frame(values: np.ndarray, index: pd.Index, columns: list[str], q: float) -> pd.DataFrame:
+    return pd.DataFrame(np.quantile(values, q, axis=0), index=index, columns=columns)
 
 
 def _coerce_spend_to_df(
@@ -186,6 +216,35 @@ def _safe_divide(
         return pd.Series(out, index=numer.index, name=numer.name)
     else:
         raise TypeError("numer must be a pandas Series or DataFrame")
+
+
+def _safe_divide_arr(
+    numer: np.ndarray,
+    denom: np.ndarray,
+    on_zero: ZeroHandling,
+) -> np.ndarray:
+    """Elementwise division for numpy arrays with configurable zero handling."""
+
+    if numer.shape != denom.shape:
+        raise ValueError("numer and denom must share the same shape")
+
+    denom_safe = denom.astype(float, copy=True)
+    zero_mask = denom_safe == 0
+    denom_safe[zero_mask] = np.nan
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = numer / denom_safe
+
+    if on_zero == "nan":
+        pass
+    elif on_zero == "inf":
+        out[zero_mask] = np.inf
+    elif on_zero == "zero":
+        out[zero_mask] = 0.0
+    else:
+        raise ValueError("on_zero must be 'nan', 'inf', or 'zero'.")
+
+    return out
 
 
 def compute_roi(
@@ -306,6 +365,177 @@ def compute_roi(
     )
 
 
+def compute_roi_from_draws(
+    *,
+    contribution_draws: ContributionDraws,
+    spend_tactical: Union[pd.DataFrame, np.ndarray],
+    hierarchy: Hierarchy,
+    definition: Definition = "roas",
+    on_zero_spend: ZeroHandling = "nan",
+    time_index: Optional[Union[pd.Index, slice, np.ndarray, list]] = None,
+    return_time_series: bool = True,
+    ci: Tuple[float, float] = (0.05, 0.95),
+) -> Tuple[ROIResult, ROIUncertainty]:
+    """Compute ROI/ROAS uncertainty from per-draw contributions."""
+
+    if definition not in ("roas", "roi"):
+        raise ValueError("definition must be either 'roas' or 'roi'.")
+
+    D, T, N_t = contribution_draws.tactical.shape
+    tac_names = list(hierarchy.tactical_names)
+    if len(tac_names) != N_t:
+        tac_names = [f"tactical_{idx}" for idx in range(N_t)]
+
+    if isinstance(spend_tactical, pd.DataFrame):
+        if spend_tactical.shape[1] != N_t:
+            raise ValueError(
+                f"spend_tactical has {spend_tactical.shape[1]} columns, expected {N_t} to match contributions."
+            )
+        if len(spend_tactical.index) != T:
+            raise ValueError(
+                f"spend_tactical has {len(spend_tactical.index)} rows, expected {T} to match contributions."
+            )
+        like = spend_tactical.copy()
+    else:
+        index = pd.RangeIndex(T, name="time")
+        like = pd.DataFrame(0.0, index=index, columns=tac_names)
+
+    spend_df = _coerce_spend_to_df(spend_tactical, like=like, name="spend_tactical")
+    spend_df = spend_df.astype(float)
+    idx = spend_df.index
+    tac_names = list(spend_df.columns)
+
+    platform_names = list(hierarchy.platform_names)
+    channel_names = list(hierarchy.channel_names)
+
+    spend_platform = pd.DataFrame(
+        spend_df.values @ hierarchy.M_tp,
+        index=idx,
+        columns=platform_names,
+    )
+    spend_channel = pd.DataFrame(
+        spend_df.values @ hierarchy.M_tc,
+        index=idx,
+        columns=channel_names,
+    )
+
+    tac_num = (
+        contribution_draws.tactical
+        if definition == "roas"
+        else contribution_draws.tactical - spend_df.values[None, ...]
+    )
+    plat_num = (
+        contribution_draws.platform
+        if definition == "roas"
+        else contribution_draws.platform - spend_platform.values[None, ...]
+    )
+    chan_num = (
+        contribution_draws.channel
+        if definition == "roas"
+        else contribution_draws.channel - spend_channel.values[None, ...]
+    )
+
+    tac_den = np.broadcast_to(spend_df.values[None, ...], (D, T, N_t))
+    plat_den = np.broadcast_to(spend_platform.values[None, ...], (D, T, hierarchy.num_platforms))
+    chan_den = np.broadcast_to(spend_channel.values[None, ...], (D, T, hierarchy.num_channels))
+
+    if return_time_series:
+        tac_ts = _safe_divide_arr(tac_num, tac_den, on_zero_spend)
+        plat_ts = _safe_divide_arr(plat_num, plat_den, on_zero_spend)
+        chan_ts = _safe_divide_arr(chan_num, chan_den, on_zero_spend)
+    else:
+        tac_ts = plat_ts = chan_ts = None
+
+    if time_index is None:
+        window_df = spend_df
+    else:
+        window_df = spend_df.loc[time_index]
+    window_index = window_df.index
+    window_pos = spend_df.index.get_indexer(window_index)
+    if np.any(window_pos < 0):
+        raise KeyError("time_index selection could not be aligned with spend index.")
+
+    tac_tot = _safe_divide_arr(
+        tac_num[:, window_pos, :].sum(axis=1),
+        tac_den[:, window_pos, :].sum(axis=1),
+        on_zero_spend,
+    )
+    plat_tot = _safe_divide_arr(
+        plat_num[:, window_pos, :].sum(axis=1),
+        plat_den[:, window_pos, :].sum(axis=1),
+        on_zero_spend,
+    )
+    chan_tot = _safe_divide_arr(
+        chan_num[:, window_pos, :].sum(axis=1),
+        chan_den[:, window_pos, :].sum(axis=1),
+        on_zero_spend,
+    )
+
+    tactical_series = pd.Series(tac_tot.mean(axis=0), index=tac_names, name=definition)
+    platform_series = pd.Series(plat_tot.mean(axis=0), index=platform_names, name=definition)
+    channel_series = pd.Series(chan_tot.mean(axis=0), index=channel_names, name=definition)
+
+    if return_time_series:
+        tactical_ts_mean = pd.DataFrame(tac_ts.mean(axis=0), index=idx, columns=tac_names)
+        platform_ts_mean = pd.DataFrame(plat_ts.mean(axis=0), index=idx, columns=platform_names)
+        channel_ts_mean = pd.DataFrame(chan_ts.mean(axis=0), index=idx, columns=channel_names)
+    else:
+        tactical_ts_mean = platform_ts_mean = channel_ts_mean = None
+
+    roi_result = ROIResult(
+        tactical=tactical_series,
+        platform=platform_series,
+        channel=channel_series,
+        tactical_ts=tactical_ts_mean,
+        platform_ts=platform_ts_mean,
+        channel_ts=channel_ts_mean,
+        definition=definition,
+        window=window_index,
+    )
+
+    lower, upper = ci
+    roi_uncertainty = ROIUncertainty(
+        tactical=ROIInterval(
+            lower=_quantile_series(tac_tot, tactical_series.index, lower, "tactical"),
+            upper=_quantile_series(tac_tot, tactical_series.index, upper, "tactical"),
+        ),
+        platform=ROIInterval(
+            lower=_quantile_series(plat_tot, platform_series.index, lower, "platform"),
+            upper=_quantile_series(plat_tot, platform_series.index, upper, "platform"),
+        ),
+        channel=ROIInterval(
+            lower=_quantile_series(chan_tot, channel_series.index, lower, "channel"),
+            upper=_quantile_series(chan_tot, channel_series.index, upper, "channel"),
+        ),
+        tactical_ts=(
+            ROIIntervalTS(
+                lower=_quantile_frame(tac_ts, idx, tac_names, lower),
+                upper=_quantile_frame(tac_ts, idx, tac_names, upper),
+            )
+            if return_time_series
+            else None
+        ),
+        platform_ts=(
+            ROIIntervalTS(
+                lower=_quantile_frame(plat_ts, idx, platform_names, lower),
+                upper=_quantile_frame(plat_ts, idx, platform_names, upper),
+            )
+            if return_time_series
+            else None
+        ),
+        channel_ts=(
+            ROIIntervalTS(
+                lower=_quantile_frame(chan_ts, idx, channel_names, lower),
+                upper=_quantile_frame(chan_ts, idx, channel_names, upper),
+            )
+            if return_time_series
+            else None
+        ),
+    )
+
+    return roi_result, roi_uncertainty
+
+
 def compute_roas(
     *,
     contributions: Contributions,
@@ -328,4 +558,12 @@ def compute_roas(
     )
 
 
-__all__ = ["ROIResult", "compute_roi", "compute_roas"]
+__all__ = [
+    "ROIResult",
+    "ROIInterval",
+    "ROIIntervalTS",
+    "ROIUncertainty",
+    "compute_roi",
+    "compute_roi_from_draws",
+    "compute_roas",
+]
