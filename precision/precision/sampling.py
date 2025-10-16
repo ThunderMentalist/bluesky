@@ -44,6 +44,7 @@ class PosteriorSamples:
     tau_beta: np.ndarray | None = None
     tau0: np.ndarray | None = None
     lambda_local: np.ndarray | None = None
+    s_sat: np.ndarray | None = None
 
     def stack_chains(self) -> "PosteriorSamples":
         """Return a copy with chain and sample dimensions flattened."""
@@ -71,6 +72,7 @@ class PosteriorSamples:
             lambda_local=None
             if self.lambda_local is None
             else _stack_last_two(self.lambda_local),
+            s_sat=None if self.s_sat is None else _stack_last_two(self.s_sat),
         )
 
 
@@ -162,6 +164,7 @@ def run_nuts(
     tau_beta = name_to_tensor.get("tau_beta")
     tau0 = name_to_tensor.get("tau0")
     lambda_local = name_to_tensor.get("lambda_local")
+    s_sat = name_to_tensor.get("s_sat")
 
     return PosteriorSamples(
         beta0=name_to_tensor["beta0"],
@@ -178,6 +181,7 @@ def run_nuts(
         tau_beta=tau_beta,
         tau0=tau0,
         lambda_local=lambda_local,
+        s_sat=s_sat,
     )
 
 

@@ -52,7 +52,15 @@ def posterior_mean(samples: PosteriorSamples) -> dict[str, np.ndarray | None]:
         "tau_beta": _mean(samples.tau_beta),
         "tau0": _mean(samples.tau0),
         "lambda_local": _mean(samples.lambda_local),
+        "s_sat": _mean(samples.s_sat),
     }
+
+
+def _saturate_log1p_np(x: np.ndarray, s: float) -> np.ndarray:
+    """Apply the minor saturation transform elementwise."""
+
+    s_safe = float(max(s, 1e-9))
+    return s_safe * np.log1p(x / s_safe)
 
 
 def beta_per_tactical_from_params(
@@ -112,6 +120,7 @@ def compute_contributions_from_params(
     beta_tactical: Optional[np.ndarray] = None,
     normalize_adstock: bool = True,
     time_index: Optional[pd.Index] = None,
+    saturation_scale: Optional[float] = None,
 ) -> Contributions:
     """Compute contributions for a given parameter realisation.
 
@@ -126,6 +135,10 @@ def compute_contributions_from_params(
         time_index = pd.RangeIndex(T, name="time")
 
     adstocked = adstock_geometric_np(U_tactical, delta, normalize=normalize_adstock)
+    if saturation_scale is not None:
+        if saturation_scale <= 0:
+            raise ValueError("saturation_scale must be positive")
+        adstocked = _saturate_log1p_np(adstocked, float(saturation_scale))
     beta_per_tactical = beta_per_tactical_from_params(
         hierarchy,
         beta_channel=beta_channel,
