@@ -39,7 +39,7 @@ class ParamSpec:
 def _saturate_log1p(x: tf.Tensor, s: tf.Tensor) -> tf.Tensor:
     """Apply the concave saturation transform elementwise."""
 
-    s_safe = tf.maximum(s, DTYPE(1e-9))
+    s_safe = tf.maximum(s, tf.cast(1e-9, DTYPE))
     return s_safe * tf.math.log1p(x / s_safe)
 
 
@@ -464,8 +464,8 @@ def make_target_log_prob_fn(
         c2 = hs_slab_scale**2
 
     if sparsity == "horseshoe":
-        half_cauchy_global = tfd.HalfCauchy(scale=hs_global)
-        half_cauchy_local = tfd.HalfCauchy(scale=const(1.0))
+        half_cauchy_global = tfd.HalfCauchy(loc=const(0.0), scale=hs_global)
+        half_cauchy_local = tfd.HalfCauchy(loc=const(0.0), scale=const(1.0))
 
         if priors.use_saturation:
 

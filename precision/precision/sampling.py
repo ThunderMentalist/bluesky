@@ -114,8 +114,7 @@ def run_nuts(
 
     nuts = tfp.mcmc.NoUTurnSampler(
         target_log_prob_fn=target_log_prob_fn,
-        step_size=DTYPE(init_step_size),
-        seed=seed,
+        step_size=tf.cast(init_step_size, DTYPE),
     )
 
     transformed = tfp.mcmc.TransformedTransitionKernel(
@@ -126,7 +125,7 @@ def run_nuts(
     adapt = tfp.mcmc.DualAveragingStepSizeAdaptation(
         inner_kernel=transformed,
         num_adaptation_steps=int(0.8 * num_burnin),
-        target_accept_prob=DTYPE(0.8),
+        target_accept_prob=tf.cast(0.8, DTYPE),
         step_size_setter_fn=lambda pkr, new_step_size: pkr._replace(
             inner_results=pkr.inner_results._replace(step_size=new_step_size)
         ),
@@ -143,6 +142,7 @@ def run_nuts(
             kernel=adapt,
             trace_fn=None,
             return_final_kernel_results=False,
+            seed=seed,
         )
 
     samples_constrained = list(_sample())
