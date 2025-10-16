@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import warnings
 
 from .hierarchy import Hierarchy
 from .posterior import make_target_log_prob_fn
@@ -23,6 +24,7 @@ from .summaries import (
     posterior_mean,
     summarise_decay_rates,
 )
+from .psis import psis_loo_pointwise, stacking_weights_from_pointwise_logdens
 
 MetricName = str
 
@@ -52,6 +54,59 @@ class EnsembleResult:
     weights: Dict[MetricName, float]
     contributions_weighted: Contributions
     uncertainty_weighted: ContributionUncertainty
+
+
+def _shift_with_lag(U: np.ndarray, lag: int) -> np.ndarray:
+    """Shift matrix ``U`` forward by ``lag`` periods, padding with zeros."""
+
+    if lag <= 0:
+        return U
+    T, N = U.shape
+    out = np.zeros_like(U)
+    if lag < T:
+        out[lag:, :] = U[:-lag, :]
+    return out
+
+
+def _apply_metric_lags(
+    U_metrics: Dict[MetricName, Optional[np.ndarray]],
+    metric_lags: Optional[Dict[MetricName, int]],
+) -> Dict[MetricName, Optional[np.ndarray]]:
+    if not metric_lags:
+        return U_metrics
+    out: Dict[MetricName, Optional[np.ndarray]] = {}
+    for name, matrix in U_metrics.items():
+        if matrix is None:
+            out[name] = None
+            continue
+        lag = int(metric_lags.get(name, 0))
+        out[name] = _shift_with_lag(matrix, lag)
+    return out
+
+
+def _check_metric_overlap(
+    y: np.ndarray,
+    U: Optional[np.ndarray],
+    name: str,
+    *,
+    corr_thresh: float = 0.97,
+) -> None:
+    """Basic leakage guardrail based on correlation with the outcome."""
+
+    if U is None:
+        return
+    if U.shape[0] != y.shape[0]:
+        return
+    aggregate = U.sum(axis=1)
+    y_std = (y - y.mean()) / (y.std(ddof=0) + 1e-9)
+    agg_std = (aggregate - aggregate.mean()) / (aggregate.std(ddof=0) + 1e-9)
+    corr = float(np.clip(np.corrcoef(y_std, agg_std)[0, 1], -1.0, 1.0))
+    if np.isfinite(corr) and abs(corr) >= corr_thresh:
+        raise ValueError(
+            "Potential leakage detected: metric "
+            f"'{name}' correlates {corr:.3f} with the dependent variable. "
+            "Ensure the metric is pre-treatment or lagged appropriately."
+        )
 
 
 def _fill_missing_metrics_per_tactical(
@@ -337,6 +392,34 @@ def _stacking_weights_from_loglik(
     return {keys[idx]: float(w[idx]) for idx in range(len(keys))}
 
 
+def _compute_weights_psis_loo(
+    per_model: Dict[MetricName, PerModelResult]
+) -> Dict[MetricName, float]:
+    """Compute stacking weights by maximising PSIS-LOO predictive density."""
+
+    if not per_model:
+        return {}
+
+    pointwise: Dict[MetricName, np.ndarray] = {}
+    for name, result in per_model.items():
+        loo_lpd, pareto_k = psis_loo_pointwise(result.log_likelihood_draws)
+        pointwise[name] = loo_lpd
+        if np.mean(pareto_k > 0.7) > 0.1:
+            warnings.warn(
+                (
+                    "PSIS-LOO may be unstable for metric "
+                    f"'{name}' (k > 0.7 in more than 10% of time points)."
+                ),
+                RuntimeWarning,
+            )
+
+    weights = stacking_weights_from_pointwise_logdens(pointwise)
+    if not weights:
+        uniform = 1.0 / len(per_model)
+        return {name: uniform for name in per_model}
+    return weights
+
+
 def _compute_weights(
     per_model: Dict[MetricName, PerModelResult],
     scheme: str,
@@ -344,6 +427,8 @@ def _compute_weights(
 ) -> Dict[MetricName, float]:
     """Compute model weights under the requested ``scheme``."""
 
+    if scheme == "psis_loo":
+        return _compute_weights_psis_loo(per_model)
     if scheme == "stacking":
         weights = _stacking_weights_from_loglik(
             {name: result.log_likelihood_draws for name, result in per_model.items()}
@@ -365,7 +450,7 @@ def _compute_weights(
             metrics[name] = 1.0
         else:
             raise ValueError(
-                "Unknown weighting scheme. Use 'stacking', 'r2', 'rmse', 'mae', 'sigma', or 'uniform'."
+                "Unknown weighting scheme. Use 'psis_loo', 'stacking', 'r2', 'rmse', 'mae', 'sigma', or 'uniform'."
             )
 
     raw = {name: value**power for name, value in metrics.items()}
@@ -496,8 +581,12 @@ def ensemble(
     normalize_adstock: bool = True,
     priors: Optional[Priors] = None,
     nuts_args: Optional[Dict] = None,
-    weight_scheme: str = "stacking",
+    weight_scheme: str = "psis_loo",
     weight_power: float = 1.0,
+    metric_lags: Optional[Dict[MetricName, int]] = None,
+    offline_channels: Optional[List[str]] = None,
+    enforce_offline_exclusion: bool = True,
+    leakage_corr_threshold: float = 0.97,
 ) -> EnsembleResult:
     """Fit per-metric MMMs and aggregate their contributions.
 
@@ -505,6 +594,9 @@ def ensemble(
     media metric matrices (impressions, clicks, conversions). For tacticals
     where a metric is unavailable, provide ``availability`` to zero out the
     corresponding columns instead of copying exposure from another metric.
+    Additional safeguards include per-metric lags, leakage checks, offline
+    channel exclusion for secondary metrics, and PSIS-LOO-based stacking
+    weights.
     """
 
     priors = priors or Priors()
@@ -513,7 +605,41 @@ def ensemble(
     nuts_args = nuts_args or {}
     full_nuts_args = {**nuts_defaults, **nuts_args}
 
-    U_full = _fill_missing_metrics_per_tactical(U_metrics, availability, fallback_order)
+    # Step 1: metric pre-processing
+    U_lagged = _apply_metric_lags(U_metrics, metric_lags)
+    for metric_name in ["impressions", "clicks", "conversions"]:
+        _check_metric_overlap(
+            y,
+            U_lagged.get(metric_name),
+            metric_name,
+            corr_thresh=leakage_corr_threshold,
+        )
+
+    availability_masks = availability.copy() if availability is not None else {}
+    if enforce_offline_exclusion and offline_channels:
+        offline_set = set(offline_channels)
+        offline_tacticals = np.array(
+            [
+                hierarchy.channel_names[hierarchy.p_to_c[hierarchy.t_to_p[t]]] in offline_set
+                for t in range(hierarchy.num_tacticals)
+            ],
+            dtype=bool,
+        )
+        for secondary_metric in ["clicks", "conversions"]:
+            existing = availability_masks.get(secondary_metric)
+            if existing is None:
+                mask = ~offline_tacticals
+            else:
+                if existing.shape[0] != hierarchy.num_tacticals:
+                    raise ValueError(
+                        "availability mask for metric '"
+                        + secondary_metric
+                        + "' has incorrect length."
+                    )
+                mask = existing.astype(bool) & (~offline_tacticals)
+            availability_masks[secondary_metric] = mask.astype(np.uint8)
+
+    U_full = _fill_missing_metrics_per_tactical(U_lagged, availability_masks, fallback_order)
 
     per_model: Dict[MetricName, PerModelResult] = {}
     for metric_name in ["impressions", "clicks", "conversions"]:

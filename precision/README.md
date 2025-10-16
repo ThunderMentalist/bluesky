@@ -37,3 +37,42 @@ pytest
 
 See `scripts/demo_run.py` for an end-to-end example that simulates data, runs NUTS, and
 prints summarised decay rates and channel contributions.
+
+### PSIS-LOO stacking and metric safeguards
+
+```python
+from precision.ensemble import ensemble
+from precision.hierarchy import build_hierarchy
+import numpy as np
+
+# Example hierarchy
+hierarchy = build_hierarchy({
+    "channel_TV": {"platform_TV": ["tv_spot_a", "tv_spot_b"]},
+    "channel_Search": {"platform_Search": ["search_brand", "search_generic"]},
+})
+
+T = 100  # time periods
+N = hierarchy.num_tacticals
+
+U_metrics = {
+    "impressions": np.random.gamma(5.0, 20.0, size=(T, N)),
+    "clicks": np.random.gamma(3.0, 2.0, size=(T, N)),
+    "conversions": np.random.gamma(2.0, 0.5, size=(T, N)),
+}
+
+y = np.random.normal(1000.0, 50.0, size=T)
+
+result = ensemble(
+    hierarchy=hierarchy,
+    y=y,
+    U_metrics=U_metrics,
+    metric_lags={"clicks": 1, "conversions": 2},
+    offline_channels=["channel_TV"],
+    weight_scheme="psis_loo",  # default stacking scheme using PSIS-LOO
+)
+
+print(result.weights)
+```
+
+The helper applies per-metric lags, performs leakage checks, excludes offline tacticals
+from downstream metrics, and stacks models using PSIS-LOO log predictive densities.
