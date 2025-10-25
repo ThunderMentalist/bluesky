@@ -1,21 +1,13 @@
 import numpy as np
 import tensorflow as tf
 
-from precision.precision.hierarchy import Hierarchy
+from precision.precision.hierarchy import build_hierarchy
 from precision.precision.posterior import ParamSpec, _saturate_log1p, make_target_log_prob_fn
 from precision.precision.priors import Priors
 
 
 def _make_simple_hierarchy():
-    return Hierarchy(
-        channel_names=["c1"],
-        platform_names=["p1"],
-        tactical_names=["t1"],
-        M_tp=np.ones((1, 1)),
-        M_tc=np.ones((1, 1)),
-        t_to_p=np.array([0], dtype=int),
-        p_to_c=np.array([0], dtype=int),
-    )
+    return build_hierarchy({"c1": {"p1": ["t1"]}}, ["tactical", "platform", "channel"])
 
 
 def test_saturate_log1p_behaviour():
