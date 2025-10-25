@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 import numpy as np
@@ -24,6 +24,10 @@ def _stack_last_two(array: np.ndarray) -> np.ndarray:
 
 def _softplus_numpy(x: np.ndarray) -> np.ndarray:
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0.0)
+
+
+def _stack_dict(values: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    return {name: _stack_last_two(array) for name, array in values.items()}
 
 
 @dataclass
@@ -48,6 +52,8 @@ class PosteriorSamples:
     eta_channel: np.ndarray | None = None
     eta_platform: np.ndarray | None = None
     eta_tactical: np.ndarray | None = None
+    eta_by_level: Dict[str, np.ndarray] = field(default_factory=dict)
+    beta_by_level: Dict[str, np.ndarray] = field(default_factory=dict)
 
     def stack_chains(self) -> "PosteriorSamples":
         """Return a copy with chain and sample dimensions flattened."""
@@ -85,6 +91,8 @@ class PosteriorSamples:
             eta_tactical=None
             if self.eta_tactical is None
             else _stack_last_two(self.eta_tactical),
+            eta_by_level=_stack_dict(self.eta_by_level),
+            beta_by_level=_stack_dict(self.beta_by_level),
         )
 
 
@@ -151,6 +159,9 @@ def run_nuts(
         spec.name: tensor.numpy() for spec, tensor in zip(param_spec, samples_constrained)
     }
 
+    sample_shape = name_to_tensor["beta0"].shape[:2]
+    empty_vec = np.zeros((*sample_shape, 0))
+
     mode = dims.get("mode", "beta")
 
     if mode == "beta":
@@ -171,16 +182,36 @@ def run_nuts(
     else:
         raise ValueError(f"Unknown mode {mode!r}")
 
-    eta_channel = name_to_tensor.get("eta_channel")
-    if eta_channel is None:
-        raise KeyError("eta_channel parameter missing from samples")
-    beta_channel = np.exp(eta_channel)
+    leaf_level = dims.get("leaf_level")
+    beta_level = dims.get("beta_level")
+    pool_parent_level = dims.get("pool_parent_level")
 
-    eta_platform = name_to_tensor.get("eta_platform")
-    beta_platform = None if eta_platform is None else np.exp(eta_platform)
+    eta_arrays: Dict[str, np.ndarray] = {}
+    beta_arrays: Dict[str, np.ndarray] = {}
+    for name, tensor in name_to_tensor.items():
+        if name.startswith("eta_"):
+            level = name[len("eta_"):]
+            eta_arrays[level] = tensor
+            beta_arrays[level] = np.exp(tensor)
 
-    eta_tactical = name_to_tensor.get("eta_tactical")
-    beta_tactical = None if eta_tactical is None else np.exp(eta_tactical)
+    def _get_eta(level: str | None) -> np.ndarray:
+        if level is None:
+            return empty_vec
+        return eta_arrays.get(level, empty_vec)
+
+    def _get_beta(level: str | None) -> np.ndarray:
+        if level is None:
+            return empty_vec
+        return beta_arrays.get(level, empty_vec)
+
+    eta_channel = _get_eta(pool_parent_level if pool_parent_level else beta_level)
+    beta_channel = _get_beta(pool_parent_level if pool_parent_level else beta_level)
+
+    eta_platform = _get_eta(beta_level)
+    beta_platform = _get_beta(beta_level)
+
+    eta_tactical = _get_eta(leaf_level)
+    beta_tactical = _get_beta(leaf_level)
     tau_beta = name_to_tensor.get("tau_beta")
     tau0 = name_to_tensor.get("tau0")
     lambda_local = name_to_tensor.get("lambda_local")
@@ -196,8 +227,8 @@ def run_nuts(
         logit_delta=extras.get("logit_delta"),
         mu_c=extras.get("mu_c"),
         tau_c=extras.get("tau_c"),
-        beta_platform=beta_platform,
-        beta_tactical=beta_tactical,
+        beta_platform=beta_platform if beta_platform.size else None,
+        beta_tactical=beta_tactical if beta_tactical.size else None,
         tau_beta=tau_beta,
         tau0=tau0,
         lambda_local=lambda_local,
@@ -205,6 +236,8 @@ def run_nuts(
         eta_channel=eta_channel,
         eta_platform=eta_platform,
         eta_tactical=eta_tactical,
+        eta_by_level=eta_arrays,
+        beta_by_level=beta_arrays,
     )
 
 
