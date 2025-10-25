@@ -52,12 +52,13 @@ def test_mmm_pipeline_runs(monkeypatch):
     monkeypatch.setattr("precision.precision.sampling.run_nuts", fake_run_nuts)
 
     rng = np.random.default_rng(0)
+    levels = ["tactical", "platform", "channel"]
     spec = {
         "channel100": {"platform110": ["tactical111", "tactical112"]},
         "channel200": {"platform210": ["tactical211", "tactical212"]},
         "channel300": {"platform310": ["tactical311", "tactical312"]},
     }
-    hierarchy = build_hierarchy(spec)
+    hierarchy = build_hierarchy(spec, levels)
 
     T = 12
     num_tacticals = hierarchy.num_tacticals
@@ -134,7 +135,8 @@ def test_beta_per_tactical_helper_priority():
     except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
         pytest.skip(f"precision package unavailable due to dependency error: {exc}")
 
-    hierarchy = build_hierarchy({"c1": {"p1": ["t1", "t2"], "p2": ["t3"]}})
+    levels = ["tactical", "platform", "channel"]
+    hierarchy = build_hierarchy({"c1": {"p1": ["t1", "t2"], "p2": ["t3"]}}, levels)
 
     beta_channel = np.array([1.0], dtype=float)
     expected_channel = hierarchy.M_tc @ beta_channel
@@ -194,8 +196,9 @@ def test_make_target_log_prob_fn_beta_structures_smoke(beta_structure: str, spar
     except ModuleNotFoundError as exc:  # pragma: no cover - dependency guard
         pytest.skip(f"precision package unavailable due to dependency error: {exc}")
 
+    levels = ["tactical", "platform", "channel"]
     spec = {"c1": {"p1": ["t1", "t2"], "p2": ["t3"]}}
-    hierarchy = build_hierarchy(spec)
+    hierarchy = build_hierarchy(spec, levels)
     T = 5
     N_t = hierarchy.num_tacticals
     y = np.zeros(T, dtype=float)

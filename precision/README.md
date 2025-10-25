@@ -46,10 +46,11 @@ from precision.hierarchy import build_hierarchy
 import numpy as np
 
 # Example hierarchy
+levels = ["tactical", "platform", "channel"]
 hierarchy = build_hierarchy({
     "channel_TV": {"platform_TV": ["tv_spot_a", "tv_spot_b"]},
     "channel_Search": {"platform_Search": ["search_brand", "search_generic"]},
-})
+}, levels)
 
 T = 100  # time periods
 N = hierarchy.num_tacticals

@@ -19,6 +19,7 @@ def main(seed: int = 123) -> None:
     rng = np.random.default_rng(seed)
 
     # --- 1) Define hierarchy -------------------------------------------------
+    levels = ["tactical", "platform", "channel"]
     spec = {
         "channel100": {
             "platform110": ["tactical111", "tactical112", "tactical113"],
@@ -36,7 +37,7 @@ def main(seed: int = 123) -> None:
             "platform330": ["tactical331", "tactical332", "tactical333"],
         },
     }
-    hierarchy = build_hierarchy(spec)
+    hierarchy = build_hierarchy(spec, levels)
     P = hierarchy.num_platforms
     T = 52
     N_t = hierarchy.num_tacticals
