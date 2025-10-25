@@ -91,11 +91,7 @@ def make_target_log_prob_fn(
         )
 
     U_tf = tf.convert_to_tensor(U_scaled, dtype=DTYPE)
-    M_tc_tf = tf.convert_to_tensor(hierarchy.M_tc, dtype=DTYPE)
-    M_tp_tf = tf.convert_to_tensor(hierarchy.M_tp, dtype=DTYPE)
-    t_to_p = tf.convert_to_tensor(hierarchy.t_to_p, dtype=tf.int32)
-    p_to_c = tf.convert_to_tensor(hierarchy.p_to_c, dtype=tf.int32)
-    t_to_c = tf.gather(p_to_c, t_to_p)
+    leaf_level = hierarchy.levels[0]
 
     prior_beta0 = tfd.Normal(loc=const(0.0), scale=const(priors.beta0_sd))
     prior_gamma = (
@@ -241,6 +237,9 @@ def make_target_log_prob_fn(
     elif decay_mode == "hier_logit":
         prior_mu_c = tfd.Normal(loc=const(priors.hier_mu0), scale=const(priors.hier_mu0_sd))
         prior_tau_c = tfd.HalfNormal(scale=const(priors.hier_tau_sd))
+        idx_leaf_to_channel_decay = tf.constant(
+            hierarchy.index_map(leaf_level, "channel"), dtype=tf.int32
+        )
 
         decay_specs.append(
             ParamSpec("logit_delta", (num_tacticals,), tfb.Identity(), tf.zeros([num_tacticals], DTYPE))
@@ -264,8 +263,8 @@ def make_target_log_prob_fn(
 
         def log_prior_decay(logit_delta: tf.Tensor, mu_c: tf.Tensor, log_tau_c: tf.Tensor) -> tf.Tensor:
             tau_c = tf.math.softplus(log_tau_c)
-            mu_i = tf.gather(mu_c, t_to_c)
-            tau_i = tf.gather(tau_c, t_to_c)
+            mu_i = tf.gather(mu_c, idx_leaf_to_channel_decay)
+            tau_i = tf.gather(tau_c, idx_leaf_to_channel_decay)
             log_p = tf.reduce_sum(prior_mu_c.log_prob(mu_c))
             log_p += tf.reduce_sum(prior_tau_c.log_prob(tau_c))
             log_p += tf.reduce_sum(tf.math.log_sigmoid(log_tau_c))
@@ -327,6 +326,10 @@ def make_target_log_prob_fn(
 
     if beta_structure == "channel":
 
+        M_leaf_to_channel = tf.constant(
+            hierarchy.map(leaf_level, "channel"), dtype=DTYPE
+        )
+
         if priors.use_saturation:
 
             def target_log_prob(
@@ -340,7 +343,9 @@ def make_target_log_prob_fn(
                 decay_args = decay_and_sigma[:-1]
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, s_sat)
-                channel_series = tf.linalg.matmul(tactical_series, M_tc_tf)
+                channel_series = tf.linalg.matmul(
+                    tactical_series, M_leaf_to_channel
+                )
                 beta_channel = tf.exp(eta_channel)
                 ll = _log_likelihood(channel_series, beta_channel, beta0, gamma, sigma)
                 lp = _log_prior_common(beta0, gamma, sigma, s_sat)
@@ -360,7 +365,9 @@ def make_target_log_prob_fn(
                 decay_args = decay_and_sigma[:-1]
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, None)
-                channel_series = tf.linalg.matmul(tactical_series, M_tc_tf)
+                channel_series = tf.linalg.matmul(
+                    tactical_series, M_leaf_to_channel
+                )
                 beta_channel = tf.exp(eta_channel)
                 ll = _log_likelihood(channel_series, beta_channel, beta0, gamma, sigma)
                 lp = _log_prior_common(beta0, gamma, sigma, None)
@@ -384,6 +391,13 @@ def make_target_log_prob_fn(
 
     if beta_structure == "platform_hier":
 
+        M_leaf_to_platform = tf.constant(
+            hierarchy.map(leaf_level, "platform"), dtype=DTYPE
+        )
+        idx_platform_to_channel = tf.constant(
+            hierarchy.index_map("platform", "channel"), dtype=tf.int32
+        )
+
         if priors.use_saturation:
 
             def target_log_prob(
@@ -399,11 +413,13 @@ def make_target_log_prob_fn(
                 decay_args = decay_and_sigma[:-1]
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, s_sat)
-                platform_series = tf.linalg.matmul(tactical_series, M_tp_tf)
+                platform_series = tf.linalg.matmul(
+                    tactical_series, M_leaf_to_platform
+                )
                 beta_platform = tf.exp(eta_platform)
                 ll = _log_likelihood(platform_series, beta_platform, beta0, gamma, sigma)
 
-                eta_ch_for_p = tf.gather(eta_channel, p_to_c)
+                eta_ch_for_p = tf.gather(eta_channel, idx_platform_to_channel)
                 lp = _log_prior_common(beta0, gamma, sigma, s_sat)
                 lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += prior_tau.log_prob(tau_beta)
@@ -427,11 +443,13 @@ def make_target_log_prob_fn(
                 decay_args = decay_and_sigma[:-1]
                 delta = delta_from_args(*decay_args)
                 tactical_series = _tactical_series(delta, None)
-                platform_series = tf.linalg.matmul(tactical_series, M_tp_tf)
+                platform_series = tf.linalg.matmul(
+                    tactical_series, M_leaf_to_platform
+                )
                 beta_platform = tf.exp(eta_platform)
                 ll = _log_likelihood(platform_series, beta_platform, beta0, gamma, sigma)
 
-                eta_ch_for_p = tf.gather(eta_channel, p_to_c)
+                eta_ch_for_p = tf.gather(eta_channel, idx_platform_to_channel)
                 lp = _log_prior_common(beta0, gamma, sigma, None)
                 lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
                 lp += prior_tau.log_prob(tau_beta)
@@ -466,6 +484,9 @@ def make_target_log_prob_fn(
     if sparsity == "horseshoe":
         half_cauchy_global = tfd.HalfCauchy(loc=const(0.0), scale=hs_global)
         half_cauchy_local = tfd.HalfCauchy(loc=const(0.0), scale=const(1.0))
+        idx_leaf_to_channel = tf.constant(
+            hierarchy.index_map(leaf_level, "channel"), dtype=tf.int32
+        )
 
         if priors.use_saturation:
 
@@ -486,7 +507,7 @@ def make_target_log_prob_fn(
                 beta_tactical = tf.exp(eta_tactical)
                 ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-                eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+                eta_ch_for_t = tf.gather(eta_channel, idx_leaf_to_channel)
                 deviation = eta_tactical - eta_ch_for_t
                 lam2 = lambda_local**2
                 tau0_sq = tau0**2
@@ -519,7 +540,7 @@ def make_target_log_prob_fn(
                 beta_tactical = tf.exp(eta_tactical)
                 ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-                eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+                eta_ch_for_t = tf.gather(eta_channel, idx_leaf_to_channel)
                 deviation = eta_tactical - eta_ch_for_t
                 lam2 = lambda_local**2
                 tau0_sq = tau0**2
@@ -550,6 +571,9 @@ def make_target_log_prob_fn(
         return target_log_prob, dims, param_spec
 
     if priors.use_saturation:
+        idx_leaf_to_channel = tf.constant(
+            hierarchy.index_map(leaf_level, "channel"), dtype=tf.int32
+        )
 
         def target_log_prob(
             beta0: tf.Tensor,
@@ -567,7 +591,7 @@ def make_target_log_prob_fn(
             beta_tactical = tf.exp(eta_tactical)
             ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-            eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+            eta_ch_for_t = tf.gather(eta_channel, idx_leaf_to_channel)
             lp = _log_prior_common(beta0, gamma, sigma, s_sat)
             lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
             lp += prior_tau.log_prob(tau_beta)
@@ -578,6 +602,10 @@ def make_target_log_prob_fn(
             return ll + lp
 
     else:
+
+        idx_leaf_to_channel = tf.constant(
+            hierarchy.index_map(leaf_level, "channel"), dtype=tf.int32
+        )
 
         def target_log_prob(
             beta0: tf.Tensor,
@@ -594,7 +622,7 @@ def make_target_log_prob_fn(
             beta_tactical = tf.exp(eta_tactical)
             ll = _log_likelihood(tactical_series, beta_tactical, beta0, gamma, sigma)
 
-            eta_ch_for_t = tf.gather(eta_channel, t_to_c)
+            eta_ch_for_t = tf.gather(eta_channel, idx_leaf_to_channel)
             lp = _log_prior_common(beta0, gamma, sigma, None)
             lp += tf.reduce_sum(prior_eta_channel.log_prob(eta_channel))
             lp += prior_tau.log_prob(tau_beta)
