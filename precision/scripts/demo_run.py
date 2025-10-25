@@ -6,41 +6,36 @@ import numpy as np
 
 from precision import (
     Priors,
-    build_hierarchy,
     compute_contributions_from_params,
     make_target_log_prob_fn,
     posterior_mean,
     run_nuts,
     summarise_decay_rates,
 )
+from precision.precision.hierarchy import pad_ragged_tree, build_hierarchy
+from precision.precision.summaries import compute_contribution_arrays
 
 
 def main(seed: int = 123) -> None:
     rng = np.random.default_rng(seed)
 
     # --- 1) Define hierarchy -------------------------------------------------
-    levels = ["tactical", "platform", "channel"]
-    spec = {
-        "channel100": {
-            "platform110": ["tactical111", "tactical112", "tactical113"],
-            "platform120": ["tactical121", "tactical122", "tactical123"],
-            "platform130": ["tactical131", "tactical132", "tactical133"],
-        },
-        "channel200": {
-            "platform210": ["tactical211", "tactical212", "tactical213"],
-            "platform220": ["tactical221", "tactical222", "tactical223"],
-            "platform230": ["tactical231", "tactical232", "tactical233"],
-        },
-        "channel300": {
-            "platform310": ["tactical311", "tactical312", "tactical313"],
-            "platform320": ["tactical321", "tactical322", "tactical323"],
-            "platform330": ["tactical331", "tactical332", "tactical333"],
-        },
+    levels = ["level1", "level2", "level3"]  # bottom -> top
+    tree_ragged = {
+        "L3_A": {"L2_X": ["L1_a", "L1_b"]},
+        "L3_B": ["L1_c", "L1_d"],
     }
-    hierarchy = build_hierarchy(spec, levels)
-    P = hierarchy.num_platforms
+    tree_uniform = pad_ragged_tree(tree_ragged, levels)
+    hierarchy = build_hierarchy(tree_uniform, levels)
+
+    leaf_level = hierarchy.levels[0]
+    beta_level = hierarchy.levels[1]
+    top_level = hierarchy.levels[2]
+
     T = 52
-    N_t = hierarchy.num_tacticals
+    N_t = hierarchy.size(leaf_level)
+    N_beta = hierarchy.size(beta_level)
+    N_top = hierarchy.size(top_level)
 
     # --- 2) Simulate data (consistent with platform-hier structure) ----------
     U_tactical = rng.gamma(shape=2.0, scale=1.0, size=(T, N_t))
@@ -58,17 +53,18 @@ def main(seed: int = 123) -> None:
         return A * (1.0 - d) if normalize else A
 
     tactical_series = adstock_geometric_np(U_tactical, true_delta, normalize=True)
-    platform_series = tactical_series @ hierarchy.M_tp
+    mid_series = tactical_series @ hierarchy.map(leaf_level, beta_level)
 
-    # Platform-level effects (positive, log-lift in the model)
-    beta_channel_base = np.array([0.50, 0.30, 0.20])
-    beta_true_platform = beta_channel_base[hierarchy.p_to_c] + rng.normal(scale=0.05, size=P)
-    beta_true_platform = np.clip(beta_true_platform, 0.02, None)
+    # Level-2 effects (positive, log-lift in the model)
+    beta_top_base = np.linspace(0.5, 0.3, N_top)
+    idx_mid_to_top = hierarchy.index_map(beta_level, top_level)
+    beta_true_mid = beta_top_base[idx_mid_to_top] + rng.normal(scale=0.05, size=N_beta)
+    beta_true_mid = np.clip(beta_true_mid, 0.02, None)
 
     # Controls & outcome
     gamma_true = rng.normal(scale=0.2, size=Z_controls.shape[1])
     beta0_true = 1.0
-    mean = beta0_true + platform_series @ beta_true_platform + Z_controls @ gamma_true
+    mean = beta0_true + mid_series @ beta_true_mid + Z_controls @ gamma_true
     y = mean + rng.normal(scale=1.0, size=T)
 
     # --- 3) Build target log-prob (uses scaling + centering by default) ------
@@ -102,6 +98,38 @@ def main(seed: int = 123) -> None:
     post = posterior_mean(samples)
     decay_summary = summarise_decay_rates(samples, hierarchy)
     print(decay_summary.head())
+
+    leaf_level_resolved, beta_level_resolved, pool_parent = priors.resolve_beta_levels(
+        hierarchy.levels
+    )
+    beta_by_level = post.get("beta_by_level", {})
+    beta_est = beta_by_level.get(beta_level_resolved)
+    if beta_est is None:
+        raise ValueError(f"Posterior mean for beta level {beta_level_resolved!r} not available")
+    print(
+        "Resolved beta placement:",
+        f"leaf={leaf_level_resolved}",
+        f"beta={beta_level_resolved}",
+        f"pool_parent={pool_parent}",
+    )
+
+    contrib_arrays = compute_contribution_arrays(
+        U_raw=U_tactical,
+        delta=post["delta"],
+        beta=beta_est,
+        beta_level=beta_level_resolved,
+        hierarchy=hierarchy,
+        leaf_level=leaf_level_resolved,
+        normalize_adstock=True,
+        use_saturation=priors.use_saturation,
+        s_sat=post.get("s_sat"),
+        tactical_rescale=np.asarray(dims.get("tactical_rescale", []), dtype=float)
+        if "tactical_rescale" in dims
+        else None,
+        levels=[lvl for lvl in hierarchy.levels if lvl != leaf_level_resolved],
+    )
+    for level_name, values in contrib_arrays.items():
+        print(f"Contribution array {level_name}: shape={values.shape}")
 
     # --- 6) Contributions on ORIGINAL scale ---------------------------------
     # Note: the model standardizes media and centers y.

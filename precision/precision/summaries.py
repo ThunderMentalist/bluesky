@@ -420,6 +420,12 @@ def posterior_mean(samples: PosteriorSamples) -> dict[str, np.ndarray | None]:
         "eta_channel": _mean(samples.eta_channel),
         "eta_platform": _mean(samples.eta_platform),
         "eta_tactical": _mean(samples.eta_tactical),
+        "eta_by_level": {
+            level: _mean(array) for level, array in samples.eta_by_level.items()
+        },
+        "beta_by_level": {
+            level: _mean(array) for level, array in samples.beta_by_level.items()
+        },
     }
 
 
