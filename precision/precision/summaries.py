@@ -9,8 +9,15 @@ import numpy as np
 import pandas as pd
 
 from .adstock import adstock_geometric_np
+from .constants import SAT_MIN, SIGMA_MIN
 from .hierarchy import Hierarchy
 from .sampling import PosteriorSamples
+from .scaling import (
+    apply_pre_adstock_tactical,
+    center_y as _center_y,
+    fit_media_scales_pre_adstock_tactical,
+)
+from .priors import Priors
 
 
 @dataclass
@@ -71,13 +78,13 @@ def compute_contribution_arrays(
         scale = np.asarray(tactical_rescale, dtype=float)
         if scale.ndim == 0:
             factor = float(scale)
-            U_scaled = U_raw / factor
+            U_scaled = U_raw * factor
         else:
-            U_scaled = U_raw / scale[None, :]
+            U_scaled = U_raw * scale[None, :]
     adstocked = adstock_geometric_np(U_scaled, delta, normalize=normalize_adstock)
 
     if use_saturation:
-        s_val = max(float(s_sat or 0.0), 1e-6)
+        s_val = max(float(s_sat or 0.0), SAT_MIN)
         adstocked = s_val * np.log1p(adstocked / s_val)
 
     beta_leaf = beta_per_leaf_from_params(
@@ -97,6 +104,128 @@ def compute_contribution_arrays(
         matrix = hierarchy.map(leaf_level, level)
         contributions[level] = leaf_contrib @ matrix
     return contributions
+
+
+def _student_t_logpdf(x: np.ndarray, df: float, scale: np.ndarray) -> np.ndarray:
+    """Elementwise Student-t logpdf with zero mean; x, scale broadcastable."""
+
+    from math import lgamma, pi
+
+    x2 = (x / scale) ** 2
+    return (
+        (lgamma((df + 1.0) / 2.0) - lgamma(df / 2.0))
+        - 0.5 * np.log(df * pi)
+        - np.log(scale)
+        - ((df + 1.0) / 2.0) * np.log1p(x2 / df)
+    )
+
+
+def log_likelihood_draws_single_model(
+    *,
+    y: np.ndarray,
+    U_tactical: np.ndarray,
+    Z_controls: Optional[np.ndarray],
+    hierarchy: Hierarchy,
+    priors: Priors,
+    samples: PosteriorSamples,
+    normalize_adstock: bool = True,
+) -> np.ndarray:
+    """
+    Return per-draw log-likelihoods with shape [draws, T], mirroring the model path.
+    Supports residual_mode in {"iid","ar1"} and likelihood in {"normal","student_t"}.
+    """
+
+    if priors.center_y:
+        y_centered, _ = _center_y(y)
+    else:
+        y_centered = y
+
+    Z = (
+        np.zeros((U_tactical.shape[0], 0), dtype=float)
+        if Z_controls is None
+        else np.asarray(Z_controls, dtype=float)
+    )
+    J = Z.shape[1]
+
+    if priors.standardize_media == "pre_adstock_tactical":
+        scale_vec = fit_media_scales_pre_adstock_tactical(
+            U_tactical, stat=priors.media_scale_stat
+        )
+        U_scaled = apply_pre_adstock_tactical(U_tactical, scale_vec)
+    elif priors.standardize_media == "none":
+        U_scaled = U_tactical
+    else:
+        raise ValueError(
+            "priors.standardize_media must be 'none' or 'pre_adstock_tactical'"
+        )
+
+    stacked = samples.stack_chains()
+    T, N_t = U_scaled.shape
+    leaf_level, beta_level, _ = priors.resolve_beta_levels(hierarchy.levels)
+    M_leaf_to_beta = hierarchy.map(leaf_level, beta_level)
+
+    beta_draws = stacked.beta_by_level.get(beta_level)
+    if beta_draws is None:
+        raise ValueError(f"beta_by_level[{beta_level!r}] is not present in samples")
+    draws = beta_draws.shape[0]
+    like_family = priors.likelihood
+    if like_family not in {"normal", "student_t"}:
+        raise ValueError(f"Unknown likelihood {like_family!r}")
+    resid_mode = priors.residual_mode
+    if resid_mode not in {"iid", "ar1"}:
+        raise ValueError(f"Unknown residual_mode {resid_mode!r}")
+
+    out = np.zeros((draws, T), dtype=float)
+    nu = float(priors.student_t_df)
+    beta0_draws = np.asarray(stacked.beta0, dtype=float)
+    sigma_draws = np.asarray(stacked.sigma, dtype=float)
+    gamma_draws = None if stacked.gamma is None else np.asarray(stacked.gamma, dtype=float)
+    s_sat_draws = None if stacked.s_sat is None else np.asarray(stacked.s_sat, dtype=float)
+    phi_draws = None if getattr(stacked, "phi", None) is None else np.asarray(stacked.phi, dtype=float)
+
+    for i in range(draws):
+        delta = np.asarray(stacked.delta[i], dtype=float)
+        series = adstock_geometric_np(U_scaled, delta, normalize=normalize_adstock)
+        if priors.use_saturation:
+            if s_sat_draws is None:
+                raise ValueError("s_sat samples required when use_saturation=True")
+            s_val = max(float(s_sat_draws[i]), SAT_MIN)
+            series = s_val * np.log1p(series / s_val)
+        beta_vec = np.asarray(beta_draws[i], dtype=float)
+        series_beta = series @ M_leaf_to_beta
+        mu = float(beta0_draws[i]) + series_beta @ beta_vec
+        if J > 0 and gamma_draws is not None:
+            gamma_vec = np.asarray(gamma_draws[i], dtype=float)
+            if gamma_vec.size:
+                mu = mu + Z @ gamma_vec
+        sigma = max(float(sigma_draws[i]), SIGMA_MIN)
+
+        if resid_mode == "iid":
+            resid = y_centered - mu
+            if like_family == "normal":
+                out[i] = -0.5 * (
+                    (resid**2) / (sigma**2) + np.log(2.0 * np.pi * (sigma**2))
+                )
+            else:
+                out[i] = _student_t_logpdf(resid, df=nu, scale=np.full_like(resid, sigma))
+        else:
+            if phi_draws is None:
+                raise ValueError("phi samples required when residual_mode='ar1'")
+            phi = float(phi_draws[i])
+            resid = y_centered - mu
+            if resid.size == 0:
+                continue
+            z0 = resid[:1] * np.sqrt(max(0.0, 1.0 - phi * phi))
+            z1 = resid[1:] - phi * resid[:-1]
+            zt = np.concatenate([z0, z1], axis=0)
+            if like_family == "normal":
+                out[i] = -0.5 * (
+                    (zt**2) / (sigma**2) + np.log(2.0 * np.pi * (sigma**2))
+                )
+            else:
+                out[i] = _student_t_logpdf(zt, df=nu, scale=np.full_like(zt, sigma))
+
+    return out
 
 
 def _to_df(values: np.ndarray, index: pd.Index, columns: list[str]) -> pd.DataFrame:
@@ -668,6 +797,7 @@ __all__ = [
     "compute_contribution_arrays",
     "contributions_from_posterior",
     "contribution_sign_probabilities",
+    "log_likelihood_draws_single_model",
     "posterior_mean",
     "summarise_decay_rates",
     "compute_contributions_from_params",

@@ -68,6 +68,9 @@ class Hierarchy:
         else:
             self._init_from_legacy(**legacy_kwargs)
 
+        # Simple caches for composed mapping and index lookups.
+        self._map_cache: Dict[Tuple[str, str], np.ndarray] = {}
+        self._index_cache: Dict[Tuple[str, str], np.ndarray] = {}
         # Populate legacy convenience attributes (M_tp, etc.) when applicable.
         self.__dict__.update(_compat_three_level_fields(self))
 
@@ -168,6 +171,11 @@ class Hierarchy:
                 "Mapping is only defined from a lower level to a higher level in the hierarchy"
             )
 
+        key = (child, parent)
+        cached = self._map_cache.get(key)
+        if cached is not None:
+            return cached
+
         result = None
         for level_idx in range(child_idx, parent_idx):
             c = self.levels[level_idx]
@@ -175,6 +183,7 @@ class Hierarchy:
             M = self.maps_adjacent[(c, p)]
             result = M if result is None else result @ M
         assert result is not None  # for mypy; parent_idx > child_idx ensured a matrix was set
+        self._map_cache[key] = result
         return result
 
     def index_map(self, child: str, parent: str) -> np.ndarray:
@@ -189,11 +198,17 @@ class Hierarchy:
                 "Index mapping is only defined from a lower level to a higher level in the hierarchy"
             )
 
+        key = (self.levels[child_idx], self.levels[parent_idx])
+        cached = self._index_cache.get(key)
+        if cached is not None:
+            return cached.copy()
+
         indices = self.index_adjacent[(self.levels[child_idx], self.levels[child_idx + 1])].copy()
         for level_idx in range(child_idx + 1, parent_idx):
             lvl = self.levels[level_idx]
             nxt = self.levels[level_idx + 1]
             indices = self.index_adjacent[(lvl, nxt)][indices]
+        self._index_cache[key] = indices.copy()
         return indices
 
     @property
