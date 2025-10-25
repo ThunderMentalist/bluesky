@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -107,6 +107,72 @@ def _compat_three_level_fields(hierarchy: Hierarchy) -> Dict[str, object]:
     )
 
     return compat
+
+
+def pad_ragged_tree(
+    tree_top_to_bottom: Dict[str, Any],
+    levels: Sequence[str],
+    *,
+    placeholder_prefix: str = "__auto__",
+) -> Dict[str, Any]:
+    """Normalize ragged ``tree_top_to_bottom`` by inserting placeholder nodes.
+
+    ``tree_top_to_bottom`` is expected to map top-level node names to nested
+    subtrees as required by :func:`build_hierarchy`.  When some branches skip
+    intermediate levels, placeholder nodes are inserted so that every path
+    traverses the same ``levels`` depth.
+    """
+
+    if not isinstance(tree_top_to_bottom, dict):
+        raise TypeError("tree_top_to_bottom must be a dict of top-level nodes")
+
+    levels = list(levels)
+    if not levels:
+        raise ValueError("levels must be non-empty")
+    top_idx = len(levels) - 1
+
+    def ensure(level_idx: int, subtree: Any, parent_path: List[str]):
+        if level_idx == 0:
+            if isinstance(subtree, list):
+                return subtree
+            raise TypeError(f"Expected list at leaf level {levels[0]!r}")
+
+        if level_idx == 1 and isinstance(subtree, list):
+            return subtree
+
+        if isinstance(subtree, dict):
+            out: Dict[str, Any] = {}
+            for child_name, child_subtree in subtree.items():
+                if not isinstance(child_name, str):
+                    raise TypeError("Hierarchy node names must be strings")
+                out[child_name] = ensure(
+                    level_idx - 1, child_subtree, parent_path + [child_name]
+                )
+            return out
+
+        if isinstance(subtree, list):
+            placeholder_level = levels[level_idx - 1]
+            placeholder_name = (
+                f"{placeholder_prefix}:{placeholder_level}:"
+                f"{'/'.join(parent_path) or 'root'}"
+            )
+            return {
+                placeholder_name: ensure(
+                    level_idx - 1, subtree, parent_path + [placeholder_name]
+                )
+            }
+
+        raise TypeError(
+            f"Invalid subtree at level {levels[level_idx]!r}; expected dict or list"
+        )
+
+    normalized: Dict[str, Any] = {}
+    for top_name, subtree in tree_top_to_bottom.items():
+        if not isinstance(top_name, str):
+            raise TypeError("Hierarchy node names must be strings")
+        normalized[top_name] = ensure(top_idx, subtree, [top_name])
+
+    return normalized
 
 
 def build_hierarchy(tree: Dict, levels: Sequence[str]) -> Hierarchy:

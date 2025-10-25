@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from precision.precision.hierarchy import Hierarchy, build_hierarchy
+from precision.precision.hierarchy import Hierarchy, build_hierarchy, pad_ragged_tree
 
 
 @pytest.fixture()
@@ -72,3 +72,26 @@ def test_map_products(sample_tree, levels):
         hierarchy.index_map("tactical", "platform"),
         hierarchy.t_to_p,
     )
+
+
+def test_pad_ragged_tree_is_noop_for_uniform(sample_tree, levels):
+    padded = pad_ragged_tree(sample_tree, levels)
+    assert padded == sample_tree
+
+
+def test_pad_ragged_tree_fills_missing_levels(levels):
+    ragged = {
+        "channelA": ["t1", "t2"],
+        "channelB": {"platformB1": ["t3"]},
+    }
+
+    padded = pad_ragged_tree(ragged, levels)
+
+    placeholder = "__auto__:platform:channelA"
+    assert padded["channelA"] == {placeholder: ["t1", "t2"]}
+    assert padded["channelB"] == ragged["channelB"]
+
+    hierarchy = build_hierarchy(padded, levels)
+
+    assert placeholder in hierarchy.names["platform"]
+    assert "t1" in hierarchy.names["tactical"]
