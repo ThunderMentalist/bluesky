@@ -35,43 +35,68 @@ class ContributionUncertainty:
     fitted: ContributionIntervalSeries
 
 
-def compute_contribution_arrays(
-    U: np.ndarray,
-    Z: Optional[np.ndarray],
-    hierarchy: Hierarchy,
+def beta_per_leaf_from_params(
     *,
-    beta0: float,
-    beta_channel: Optional[np.ndarray],
-    gamma: Optional[np.ndarray],
+    beta: np.ndarray,
+    beta_level: str,
+    hierarchy: Hierarchy,
+    leaf_level: str,
+) -> np.ndarray:
+    """Project coefficients from ``beta_level`` down to the ``leaf_level``."""
+
+    coeff = np.asarray(beta, dtype=float)
+    mapping = hierarchy.map(leaf_level, beta_level)
+    return mapping @ coeff
+
+
+def compute_contribution_arrays(
+    *,
+    U_raw: np.ndarray,
     delta: np.ndarray,
+    beta: np.ndarray,
+    beta_level: str,
+    hierarchy: Hierarchy,
+    leaf_level: str,
     normalize_adstock: bool,
-    beta_platform: Optional[np.ndarray] = None,
-    beta_tactical: Optional[np.ndarray] = None,
-    tactical_scale: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Single-draw contribution arrays (tactical/platform/channel/controls/intercept/fitted)."""
+    use_saturation: bool,
+    s_sat: float | None,
+    tactical_rescale: Optional[np.ndarray] = None,
+    levels: Optional[List[str]] = None,
+) -> dict[str, np.ndarray]:
+    """Return contribution arrays for the leaf level and requested ancestors."""
 
-    adstocked = adstock_geometric_np(U, delta, normalize=normalize_adstock)
-    beta_per_tactical = beta_per_tactical_from_params(
-        hierarchy,
-        beta_channel=beta_channel,
-        beta_platform=beta_platform,
-        beta_tactical=beta_tactical,
-        tactical_scale=tactical_scale,
-    )
-    tactical = adstocked * beta_per_tactical[None, :]
-    platform = tactical @ hierarchy.M_tp
-    channel = tactical @ hierarchy.M_tc
-
-    if Z is None or gamma is None or gamma.size == 0:
-        control = np.zeros((U.shape[0], 0))
+    if tactical_rescale is None:
+        U_scaled = U_raw
     else:
-        gamma = np.atleast_1d(gamma)
-        control = (Z * gamma[None, :]) if gamma.ndim == 1 else (Z @ gamma)
+        scale = np.asarray(tactical_rescale, dtype=float)
+        if scale.ndim == 0:
+            factor = float(scale)
+            U_scaled = U_raw / factor
+        else:
+            U_scaled = U_raw / scale[None, :]
+    adstocked = adstock_geometric_np(U_scaled, delta, normalize=normalize_adstock)
 
-    intercept = np.full(U.shape[0], float(beta0))
-    fitted = intercept + channel.sum(axis=1) + (control.sum(axis=1) if control.size > 0 else 0.0)
-    return tactical, platform, channel, control, intercept, fitted
+    if use_saturation:
+        s_val = max(float(s_sat or 0.0), 1e-6)
+        adstocked = s_val * np.log1p(adstocked / s_val)
+
+    beta_leaf = beta_per_leaf_from_params(
+        beta=beta,
+        beta_level=beta_level,
+        hierarchy=hierarchy,
+        leaf_level=leaf_level,
+    )
+    leaf_contrib = adstocked * beta_leaf[None, :]
+
+    if levels is None:
+        leaf_idx = hierarchy.levels.index(leaf_level)
+        levels = hierarchy.levels[leaf_idx + 1 :]
+
+    contributions: dict[str, np.ndarray] = {leaf_level: leaf_contrib}
+    for level in levels:
+        matrix = hierarchy.map(leaf_level, level)
+        contributions[level] = leaf_contrib @ matrix
+    return contributions
 
 
 def _to_df(values: np.ndarray, index: pd.Index, columns: list[str]) -> pd.DataFrame:
@@ -149,13 +174,27 @@ def contributions_from_posterior(
 
     stacked = samples.stack_chains()
     D = stacked.beta0.shape[0]
-    T, N_t = U_tactical.shape
-    P = hierarchy.num_platforms
-    C = hierarchy.num_channels
+    T = U_tactical.shape[0]
+    leaf_level = hierarchy.levels[0]
+    leaf_names = hierarchy.names[leaf_level]
+    N_t = len(leaf_names)
+
+    platform_level = hierarchy.levels[1] if len(hierarchy.levels) > 1 else None
+    platform_names = hierarchy.names[platform_level] if platform_level is not None else []
+    P = len(platform_names)
+
+    channel_level = hierarchy.levels[2] if len(hierarchy.levels) > 2 else None
+    channel_names = hierarchy.names[channel_level] if channel_level is not None else []
+    C = len(channel_names)
     J = 0 if Z_controls is None else Z_controls.shape[1]
 
     index = pd.RangeIndex(T, name="time")
     ctrl_names = control_names or [f"control_{j}" for j in range(J)]
+
+    if U_tactical.shape[1] != N_t:
+        raise ValueError(
+            "U_tactical column count must match the number of leaf nodes in the hierarchy"
+        )
 
     tactical_draws = np.zeros((D, T, N_t))
     platform_draws = np.zeros((D, T, P))
@@ -164,27 +203,75 @@ def contributions_from_posterior(
     intercept_draws = np.zeros((D, T))
     fitted_draws = np.zeros((D, T))
 
+    has_saturation = stacked.s_sat is not None and stacked.s_sat.size > 0
+
     for d in range(D):
         beta_channel = stacked.beta_channel[d] if stacked.beta_channel.size > 0 else None
         beta_platform = None if stacked.beta_platform is None else stacked.beta_platform[d]
         beta_tactical = None if stacked.beta_tactical is None else stacked.beta_tactical[d]
-        gamma_d = None
-        if stacked.gamma is not None and stacked.gamma.size > 0:
-            gamma_d = stacked.gamma[d]
-        arrays = compute_contribution_arrays(
-            U_tactical,
-            Z_controls,
+        beta_leaf = beta_per_tactical_from_params(
             hierarchy,
-            beta0=float(stacked.beta0[d] + beta0_offset),
             beta_channel=beta_channel,
-            gamma=gamma_d,
-            delta=stacked.delta[d],
-            normalize_adstock=normalize_adstock,
             beta_platform=beta_platform,
             beta_tactical=beta_tactical,
             tactical_scale=tactical_scale,
         )
-        tactical, platform, channel, controls_arr, intercept, fitted = arrays
+
+        if has_saturation:
+            s_draw = np.ravel(stacked.s_sat[d])
+            s_sat_draw = float(s_draw[0]) if s_draw.size > 0 else None
+            use_saturation = s_sat_draw is not None
+        else:
+            s_sat_draw = None
+            use_saturation = False
+
+        contribs = compute_contribution_arrays(
+            U_raw=U_tactical,
+            delta=stacked.delta[d],
+            beta=beta_leaf,
+            beta_level=leaf_level,
+            hierarchy=hierarchy,
+            leaf_level=leaf_level,
+            normalize_adstock=normalize_adstock,
+            use_saturation=use_saturation,
+            s_sat=s_sat_draw,
+        )
+
+        tactical = contribs[leaf_level]
+        platform = (
+            contribs.get(platform_level, np.zeros((T, P)))
+            if platform_level is not None
+            else np.zeros((T, P))
+        )
+        channel = (
+            contribs.get(channel_level, np.zeros((T, C)))
+            if channel_level is not None
+            else np.zeros((T, C))
+        )
+
+        gamma_d = None
+        if stacked.gamma is not None and stacked.gamma.size > 0:
+            gamma_d = stacked.gamma[d]
+        if Z_controls is None or gamma_d is None or gamma_d.size == 0:
+            controls_arr = np.zeros((T, J))
+        else:
+            gamma_arr = np.atleast_1d(gamma_d)
+            controls_arr = (
+                Z_controls * gamma_arr[None, :]
+                if gamma_arr.ndim == 1
+                else Z_controls @ gamma_arr
+            )
+
+        intercept = np.full(T, float(stacked.beta0[d] + beta0_offset))
+        top_level = hierarchy.levels[-1]
+        marketing_total = (
+            contribs[top_level].sum(axis=1)
+            if top_level in contribs
+            else tactical.sum(axis=1)
+        )
+        control_total = controls_arr.sum(axis=1) if controls_arr.size > 0 else 0.0
+        fitted = intercept + marketing_total + control_total
+
         tactical_draws[d] = tactical
         platform_draws[d] = platform
         channel_draws[d] = channel
@@ -201,15 +288,15 @@ def contributions_from_posterior(
     mean_fitted = fitted_draws.mean(axis=0)
 
     contributions = Contributions(
-        tactical=_to_df(mean_tactical, index, hierarchy.tactical_names),
-        platform=_to_df(mean_platform, index, hierarchy.platform_names),
-        channel=_to_df(mean_channel, index, hierarchy.channel_names),
+        tactical=_to_df(mean_tactical, index, leaf_names),
+        platform=_to_df(mean_platform, index, platform_names),
+        channel=_to_df(mean_channel, index, channel_names),
         controls=_to_df(mean_controls, index, ctrl_names),
         intercept=_to_series(mean_intercept, index, "intercept"),
         fitted=_to_series(mean_fitted, index, "fitted"),
-        tactical_totals=pd.Series(mean_tactical.sum(axis=0), index=hierarchy.tactical_names),
-        platform_totals=pd.Series(mean_platform.sum(axis=0), index=hierarchy.platform_names),
-        channel_totals=pd.Series(mean_channel.sum(axis=0), index=hierarchy.channel_names),
+        tactical_totals=pd.Series(mean_tactical.sum(axis=0), index=leaf_names),
+        platform_totals=pd.Series(mean_platform.sum(axis=0), index=platform_names),
+        channel_totals=pd.Series(mean_channel.sum(axis=0), index=channel_names),
         controls_totals=(
             pd.Series(mean_controls.sum(axis=0), index=ctrl_names)
             if J > 0
@@ -221,9 +308,9 @@ def contributions_from_posterior(
 
     lower, upper = ci
     uncertainty = ContributionUncertainty(
-        tactical=_summarise_draws(tactical_draws, index, hierarchy.tactical_names, lower=lower, upper=upper),
-        platform=_summarise_draws(platform_draws, index, hierarchy.platform_names, lower=lower, upper=upper),
-        channel=_summarise_draws(channel_draws, index, hierarchy.channel_names, lower=lower, upper=upper),
+        tactical=_summarise_draws(tactical_draws, index, leaf_names, lower=lower, upper=upper),
+        platform=_summarise_draws(platform_draws, index, platform_names, lower=lower, upper=upper),
+        channel=_summarise_draws(channel_draws, index, channel_names, lower=lower, upper=upper),
         controls=_summarise_draws(controls_draws, index, ctrl_names, lower=lower, upper=upper),
         intercept=_summarise_draws_series(intercept_draws, index, "intercept", lower=lower, upper=upper),
         fitted=_summarise_draws_series(fitted_draws, index, "fitted", lower=lower, upper=upper),
@@ -273,13 +360,20 @@ def contribution_sign_probabilities(
     platform_total_prob = (draws.platform.sum(axis=1) > 0).mean(axis=0)
     channel_total_prob = (draws.channel.sum(axis=1) > 0).mean(axis=0)
 
+    leaf_level = hierarchy.levels[0]
+    leaf_names = hierarchy.names[leaf_level]
+    platform_level = hierarchy.levels[1] if len(hierarchy.levels) > 1 else None
+    platform_names = hierarchy.names[platform_level] if platform_level is not None else []
+    channel_level = hierarchy.levels[2] if len(hierarchy.levels) > 2 else None
+    channel_names = hierarchy.names[channel_level] if channel_level is not None else []
+
     return ContributionSignProb(
-        tactical_ts=pd.DataFrame(tactical_prob_ts, index=index, columns=hierarchy.tactical_names),
-        platform_ts=pd.DataFrame(platform_prob_ts, index=index, columns=hierarchy.platform_names),
-        channel_ts=pd.DataFrame(channel_prob_ts, index=index, columns=hierarchy.channel_names),
-        tactical_total=pd.Series(tactical_total_prob, index=hierarchy.tactical_names, name="Pr>0"),
-        platform_total=pd.Series(platform_total_prob, index=hierarchy.platform_names, name="Pr>0"),
-        channel_total=pd.Series(channel_total_prob, index=hierarchy.channel_names, name="Pr>0"),
+        tactical_ts=pd.DataFrame(tactical_prob_ts, index=index, columns=leaf_names),
+        platform_ts=pd.DataFrame(platform_prob_ts, index=index, columns=platform_names),
+        channel_ts=pd.DataFrame(channel_prob_ts, index=index, columns=channel_names),
+        tactical_total=pd.Series(tactical_total_prob, index=leaf_names, name="Pr>0"),
+        platform_total=pd.Series(platform_total_prob, index=platform_names, name="Pr>0"),
+        channel_total=pd.Series(channel_total_prob, index=channel_names, name="Pr>0"),
     )
 
 
@@ -346,12 +440,58 @@ def beta_per_tactical_from_params(
 ) -> np.ndarray:
     """Return per-tactical coefficients regardless of modelling structure."""
 
+    leaf_level = hierarchy.levels[0]
+    leaf_idx = hierarchy.levels.index(leaf_level)
+
+    def _map_to_leaf(
+        coeff: np.ndarray,
+        level_hint: Optional[str],
+        start_level_idx: int,
+        *,
+        prefer_highest: bool,
+    ) -> np.ndarray:
+        size = coeff.size
+        if level_hint is not None and level_hint in hierarchy.names:
+            if hierarchy.size(level_hint) == size:
+                return beta_per_leaf_from_params(
+                    beta=coeff,
+                    beta_level=level_hint,
+                    hierarchy=hierarchy,
+                    leaf_level=leaf_level,
+                )
+
+        search_levels = hierarchy.levels[start_level_idx:]
+        iterable = reversed(search_levels) if prefer_highest else search_levels
+        for level in iterable:
+            if hierarchy.size(level) == size:
+                return beta_per_leaf_from_params(
+                    beta=coeff,
+                    beta_level=level,
+                    hierarchy=hierarchy,
+                    leaf_level=leaf_level,
+                )
+        raise ValueError(
+            "No hierarchy level matches provided beta size; ensure hierarchy levels are configured"
+        )
+
     if beta_tactical is not None and beta_tactical.size > 0:
         beta = np.asarray(beta_tactical, dtype=float)
     elif beta_platform is not None and beta_platform.size > 0:
-        beta = hierarchy.M_tp @ np.asarray(beta_platform, dtype=float)
+        coeff = np.asarray(beta_platform, dtype=float)
+        beta = _map_to_leaf(
+            coeff,
+            "platform" if "platform" in hierarchy.names else None,
+            leaf_idx + 1,
+            prefer_highest=False,
+        )
     elif beta_channel is not None and beta_channel.size > 0:
-        beta = hierarchy.M_tc @ np.asarray(beta_channel, dtype=float)
+        coeff = np.asarray(beta_channel, dtype=float)
+        beta = _map_to_leaf(
+            coeff,
+            "channel" if "channel" in hierarchy.names else None,
+            leaf_idx + 1,
+            prefer_highest=True,
+        )
     else:
         raise ValueError(
             "At least one of beta_channel, beta_platform, or beta_tactical must be provided."
@@ -412,27 +552,59 @@ def compute_contributions_from_params(
     adstocked using the normalized variant to align with model fitting.
     """
 
-    T, num_tacticals = U_tactical.shape
+    T = U_tactical.shape[0]
     num_controls = 0 if Z_controls is None else Z_controls.shape[1]
 
     if time_index is None:
         time_index = pd.RangeIndex(T, name="time")
 
-    adstocked = adstock_geometric_np(U_tactical, delta, normalize=normalize_adstock)
-    if saturation_scale is not None:
-        if saturation_scale <= 0:
-            raise ValueError("saturation_scale must be positive")
-        adstocked = _saturate_log1p_np(adstocked, float(saturation_scale))
-    beta_per_tactical = beta_per_tactical_from_params(
+    leaf_level = hierarchy.levels[0]
+    leaf_names = hierarchy.names[leaf_level]
+    if U_tactical.shape[1] != len(leaf_names):
+        raise ValueError(
+            "U_tactical column count must match the number of leaf nodes in the hierarchy"
+        )
+
+    platform_level = hierarchy.levels[1] if len(hierarchy.levels) > 1 else None
+    platform_names = hierarchy.names[platform_level] if platform_level is not None else []
+    channel_level = hierarchy.levels[2] if len(hierarchy.levels) > 2 else None
+    channel_names = hierarchy.names[channel_level] if channel_level is not None else []
+
+    beta_leaf = beta_per_tactical_from_params(
         hierarchy,
         beta_channel=beta_channel,
         beta_platform=beta_platform,
         beta_tactical=beta_tactical,
         tactical_scale=tactical_scale,
     )
-    tactical_contrib = adstocked * beta_per_tactical[None, :]
-    platform_contrib = tactical_contrib @ hierarchy.M_tp
-    channel_contrib = tactical_contrib @ hierarchy.M_tc
+
+    use_saturation = saturation_scale is not None
+    if saturation_scale is not None and saturation_scale <= 0:
+        raise ValueError("saturation_scale must be positive")
+
+    contribs = compute_contribution_arrays(
+        U_raw=U_tactical,
+        delta=delta,
+        beta=beta_leaf,
+        beta_level=leaf_level,
+        hierarchy=hierarchy,
+        leaf_level=leaf_level,
+        normalize_adstock=normalize_adstock,
+        use_saturation=use_saturation,
+        s_sat=None if saturation_scale is None else float(saturation_scale),
+    )
+
+    tactical_contrib = contribs[leaf_level]
+    platform_contrib = (
+        contribs.get(platform_level, np.zeros((T, len(platform_names))))
+        if platform_level is not None
+        else np.zeros((T, len(platform_names)))
+    )
+    channel_contrib = (
+        contribs.get(channel_level, np.zeros((T, len(channel_names))))
+        if channel_level is not None
+        else np.zeros((T, len(channel_names)))
+    )
 
     if num_controls == 0 or Z_controls is None or gamma.size == 0:
         control_contrib = np.zeros((T, 0))
@@ -447,13 +619,19 @@ def compute_contributions_from_params(
             control_names = [f"control_{idx}" for idx in range(control_contrib.shape[1])]
 
     intercept_contrib = np.full(T, float(beta0) + float(beta0_offset))
-    fitted = intercept_contrib + channel_contrib.sum(axis=1)
+    top_level = hierarchy.levels[-1]
+    marketing_total = (
+        contribs[top_level].sum(axis=1)
+        if top_level in contribs
+        else tactical_contrib.sum(axis=1)
+    )
+    fitted = intercept_contrib + marketing_total
     if control_contrib.size > 0:
         fitted = fitted + control_contrib.sum(axis=1)
 
-    tactical_df = pd.DataFrame(tactical_contrib, index=time_index, columns=hierarchy.tactical_names)
-    platform_df = pd.DataFrame(platform_contrib, index=time_index, columns=hierarchy.platform_names)
-    channel_df = pd.DataFrame(channel_contrib, index=time_index, columns=hierarchy.channel_names)
+    tactical_df = pd.DataFrame(tactical_contrib, index=time_index, columns=leaf_names)
+    platform_df = pd.DataFrame(platform_contrib, index=time_index, columns=platform_names)
+    channel_df = pd.DataFrame(channel_contrib, index=time_index, columns=channel_names)
     controls_df = pd.DataFrame(control_contrib, index=time_index, columns=control_names)
     intercept_series = pd.Series(intercept_contrib, index=time_index, name="intercept")
     fitted_series = pd.Series(fitted, index=time_index, name="fitted")
@@ -487,5 +665,6 @@ __all__ = [
     "posterior_mean",
     "summarise_decay_rates",
     "compute_contributions_from_params",
+    "beta_per_leaf_from_params",
     "beta_per_tactical_from_params",
 ]

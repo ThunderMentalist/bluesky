@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from precision.precision.hierarchy import Hierarchy
+from precision.precision.hierarchy import build_hierarchy
 from precision.precision.sampling import PosteriorSamples
 from precision.precision.summaries import (
     ContributionDraws,
@@ -10,6 +10,7 @@ from precision.precision.summaries import (
     ContributionSignProb,
     Contributions,
     _saturate_log1p_np,
+    beta_per_leaf_from_params,
     beta_per_tactical_from_params,
     compute_contribution_arrays,
     compute_contributions_from_params,
@@ -21,41 +22,31 @@ from precision.precision.summaries import (
 
 
 def _hierarchy():
-    return Hierarchy(
-        channel_names=["c1"],
-        platform_names=["p1"],
-        tactical_names=["t1", "t2"],
-        M_tp=np.array([[1.0], [1.0]]),
-        M_tc=np.array([[1.0], [1.0]]),
-        t_to_p=np.array([0, 0], dtype=int),
-        p_to_c=np.array([0], dtype=int),
+    return build_hierarchy(
+        {"c1": {"p1": ["t1", "t2"]}}, ["tactical", "platform", "channel"]
     )
 
 
 def test_compute_contribution_arrays_basic():
     hierarchy = _hierarchy()
     U = np.ones((3, 2))
-    Z = np.ones((3, 1))
-    beta0 = 0.5
-    beta_channel = np.array([0.2])
-    gamma = np.array([0.1])
     delta = np.array([0.3, 0.3])
-    tactical, platform, channel, control, intercept, fitted = compute_contribution_arrays(
-        U,
-        Z,
-        hierarchy,
-        beta0=beta0,
-        beta_channel=beta_channel,
-        gamma=gamma,
+    beta_channel = np.array([0.2])
+    contribs = compute_contribution_arrays(
+        U_raw=U,
         delta=delta,
+        beta=beta_channel,
+        beta_level="channel",
+        hierarchy=hierarchy,
+        leaf_level="tactical",
         normalize_adstock=False,
+        use_saturation=False,
+        s_sat=None,
     )
-    assert tactical.shape == (3, 2)
-    assert platform.shape == (3, 1)
-    assert channel.shape == (3, 1)
-    assert control.shape == (3, 1)
-    assert intercept.shape == (3,)
-    assert fitted.shape == (3,)
+    assert set(contribs) == {"tactical", "platform", "channel"}
+    assert contribs["tactical"].shape == (3, 2)
+    assert contribs["platform"].shape == (3, 1)
+    assert contribs["channel"].shape == (3, 1)
 
 
 def test_contributions_from_posterior():
@@ -120,6 +111,14 @@ def test_saturate_log1p_np():
 
 def test_beta_per_tactical_from_params_prefers_tactical():
     hierarchy = _hierarchy()
+    beta_leaf = beta_per_leaf_from_params(
+        beta=np.array([1.5]),
+        beta_level="channel",
+        hierarchy=hierarchy,
+        leaf_level="tactical",
+    )
+    np.testing.assert_array_equal(beta_leaf, np.array([1.5, 1.5]))
+
     beta = beta_per_tactical_from_params(hierarchy, beta_tactical=np.array([1.0, 2.0]))
     np.testing.assert_array_equal(beta, np.array([1.0, 2.0]))
 

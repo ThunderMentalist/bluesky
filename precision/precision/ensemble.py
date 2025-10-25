@@ -200,9 +200,16 @@ def _make_contributions_from_arrays(
     fitted: np.ndarray,
 ) -> Contributions:
     index = pd.RangeIndex(tactical.shape[0], name="time")
-    tactical_df = _arrays_to_dataframe(tactical, index, hierarchy.tactical_names)
-    platform_df = _arrays_to_dataframe(platform, index, hierarchy.platform_names)
-    channel_df = _arrays_to_dataframe(channel, index, hierarchy.channel_names)
+    leaf_level = hierarchy.levels[0]
+    leaf_names = hierarchy.names[leaf_level]
+    platform_level = hierarchy.levels[1] if len(hierarchy.levels) > 1 else None
+    platform_names = hierarchy.names[platform_level] if platform_level is not None else []
+    channel_level = hierarchy.levels[2] if len(hierarchy.levels) > 2 else None
+    channel_names = hierarchy.names[channel_level] if channel_level is not None else []
+
+    tactical_df = _arrays_to_dataframe(tactical, index, leaf_names)
+    platform_df = _arrays_to_dataframe(platform, index, platform_names)
+    channel_df = _arrays_to_dataframe(channel, index, channel_names)
     controls_df = _arrays_to_dataframe(controls, index, control_names)
     intercept_series = _arrays_to_series(intercept, index, "intercept")
     fitted_series = _arrays_to_series(fitted, index, "fitted")
@@ -251,11 +258,25 @@ def _fit_single_metric_model(
 
     stacked: PosteriorSamples = samples.stack_chains()
     num_draws = stacked.beta0.shape[0]
-    T, num_tacticals = U.shape
-    num_platforms = hierarchy.num_platforms
-    num_channels = hierarchy.num_channels
+    T = U.shape[0]
+    leaf_level = hierarchy.levels[0]
+    leaf_names = hierarchy.names[leaf_level]
+    num_tacticals = len(leaf_names)
+
+    platform_level = hierarchy.levels[1] if len(hierarchy.levels) > 1 else None
+    platform_names = hierarchy.names[platform_level] if platform_level is not None else []
+    num_platforms = len(platform_names)
+
+    channel_level = hierarchy.levels[2] if len(hierarchy.levels) > 2 else None
+    channel_names = hierarchy.names[channel_level] if channel_level is not None else []
+    num_channels = len(channel_names)
     num_controls = 0 if Z is None else Z.shape[1]
     control_names_full = _get_control_names(control_names, num_controls)
+
+    if U.shape[1] != num_tacticals:
+        raise ValueError(
+            "U column count must match the number of leaf nodes in the hierarchy"
+        )
 
     tactical_draws = np.zeros((num_draws, T, num_tacticals))
     platform_draws = np.zeros((num_draws, T, num_platforms))
@@ -270,21 +291,68 @@ def _fit_single_metric_model(
         beta_channel = stacked.beta_channel[idx] if stacked.beta_channel.size > 0 else None
         beta_platform = None if stacked.beta_platform is None else stacked.beta_platform[idx]
         beta_tactical = None if stacked.beta_tactical is None else stacked.beta_tactical[idx]
-        gamma_draw = None
-        if stacked.gamma is not None and stacked.gamma.size > 0:
-            gamma_draw = stacked.gamma[idx]
-        tactical, platform, channel, controls_arr, intercept, fitted = compute_contribution_arrays(
-            U,
-            Z,
+        beta_leaf = beta_per_tactical_from_params(
             hierarchy,
-            beta0=float(stacked.beta0[idx]),
             beta_channel=beta_channel,
-            gamma=gamma_draw,
-            delta=stacked.delta[idx],
-            normalize_adstock=normalize_adstock,
             beta_platform=beta_platform,
             beta_tactical=beta_tactical,
         )
+
+        has_saturation = stacked.s_sat is not None and stacked.s_sat.size > 0
+        if has_saturation:
+            s_draw = np.ravel(stacked.s_sat[idx])
+            s_sat_draw = float(s_draw[0]) if s_draw.size > 0 else None
+            use_saturation = s_sat_draw is not None
+        else:
+            s_sat_draw = None
+            use_saturation = False
+
+        contribs = compute_contribution_arrays(
+            U_raw=U,
+            delta=stacked.delta[idx],
+            beta=beta_leaf,
+            beta_level=leaf_level,
+            hierarchy=hierarchy,
+            leaf_level=leaf_level,
+            normalize_adstock=normalize_adstock,
+            use_saturation=use_saturation,
+            s_sat=s_sat_draw,
+        )
+
+        tactical = contribs[leaf_level]
+        platform = (
+            contribs.get(platform_level, np.zeros((T, num_platforms)))
+            if platform_level is not None
+            else np.zeros((T, num_platforms))
+        )
+        channel = (
+            contribs.get(channel_level, np.zeros((T, num_channels)))
+            if channel_level is not None
+            else np.zeros((T, num_channels))
+        )
+
+        gamma_draw = None
+        if stacked.gamma is not None and stacked.gamma.size > 0:
+            gamma_draw = stacked.gamma[idx]
+        if Z is None or gamma_draw is None or gamma_draw.size == 0:
+            controls_arr = np.zeros((T, num_controls))
+        else:
+            gamma_arr = np.atleast_1d(gamma_draw)
+            controls_arr = (
+                Z * gamma_arr[None, :]
+                if gamma_arr.ndim == 1
+                else Z @ gamma_arr
+            )
+
+        intercept = np.full(T, float(stacked.beta0[idx]))
+        top_level = hierarchy.levels[-1]
+        marketing_total = (
+            contribs[top_level].sum(axis=1)
+            if top_level in contribs
+            else tactical.sum(axis=1)
+        )
+        control_total = controls_arr.sum(axis=1) if controls_arr.size > 0 else 0.0
+        fitted = intercept + marketing_total + control_total
 
         tactical_draws[idx] = tactical
         platform_draws[idx] = platform
@@ -313,9 +381,9 @@ def _fit_single_metric_model(
     )
 
     uncertainty = ContributionUncertainty(
-        tactical=_summarise_draws(tactical_draws, index, hierarchy.tactical_names),
-        platform=_summarise_draws(platform_draws, index, hierarchy.platform_names),
-        channel=_summarise_draws(channel_draws, index, hierarchy.channel_names),
+        tactical=_summarise_draws(tactical_draws, index, leaf_names),
+        platform=_summarise_draws(platform_draws, index, platform_names),
+        channel=_summarise_draws(channel_draws, index, channel_names),
         controls=_summarise_draws(controls_draws, index, control_names_full),
         intercept=_summarise_draws_series(intercept_draws, index, "intercept"),
         fitted=_summarise_draws_series(fitted_draws, index, "fitted"),
