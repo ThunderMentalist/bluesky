@@ -139,6 +139,19 @@ def _quantile_frame(values: np.ndarray, index: pd.Index, columns: list[str], q: 
     return pd.DataFrame(np.quantile(values, q, axis=0), index=index, columns=columns)
 
 
+def aggregate_leaf_values_to(
+    values_per_leaf: np.ndarray,
+    hierarchy: Hierarchy,
+    leaf_level: str,
+    to_level: str,
+) -> np.ndarray:
+    """Aggregate ``values_per_leaf`` from ``leaf_level`` to ``to_level`` using ``hierarchy``."""
+
+    values = np.asarray(values_per_leaf, dtype=float)
+    M = hierarchy.map(leaf_level, to_level)
+    return values @ M
+
+
 def _coerce_spend_to_df(
     spend_tactical: Union[pd.DataFrame, np.ndarray],
     like: pd.DataFrame,
@@ -269,8 +282,8 @@ def compute_roi(
         ``contributions.tactical``.  An ``ndarray`` is coerced to a DataFrame
         with that same index/column layout.
     hierarchy : Hierarchy
-        Provides ``M_tp`` and ``M_tc`` matrices for aggregating to platforms and
-        channels.
+        Provides mappings for aggregating tactical-level inputs to higher
+        levels (e.g., platforms and channels).
     definition : {"roas", "roi"}, default "roas"
         ``"roas"`` computes ``contribution / spend`` while ``"roi"`` computes
         ``(contribution - spend) / spend``.
@@ -306,13 +319,17 @@ def compute_roi(
         else None
     )
 
+    leaf_level = hierarchy.levels[0]
+    platform_level = hierarchy.levels[1]
+    channel_level = hierarchy.levels[2]
+
     spend_platform = pd.DataFrame(
-        spend_df.values @ hierarchy.M_tp,
+        aggregate_leaf_values_to(spend_df.values, hierarchy, leaf_level, platform_level),
         index=spend_df.index,
         columns=contributions.platform.columns,
     )
     spend_channel = pd.DataFrame(
-        spend_df.values @ hierarchy.M_tc,
+        aggregate_leaf_values_to(spend_df.values, hierarchy, leaf_level, channel_level),
         index=spend_df.index,
         columns=contributions.channel.columns,
     )
@@ -408,13 +425,17 @@ def compute_roi_from_draws(
     platform_names = list(hierarchy.platform_names)
     channel_names = list(hierarchy.channel_names)
 
+    leaf_level = hierarchy.levels[0]
+    platform_level = hierarchy.levels[1]
+    channel_level = hierarchy.levels[2]
+
     spend_platform = pd.DataFrame(
-        spend_df.values @ hierarchy.M_tp,
+        aggregate_leaf_values_to(spend_df.values, hierarchy, leaf_level, platform_level),
         index=idx,
         columns=platform_names,
     )
     spend_channel = pd.DataFrame(
-        spend_df.values @ hierarchy.M_tc,
+        aggregate_leaf_values_to(spend_df.values, hierarchy, leaf_level, channel_level),
         index=idx,
         columns=channel_names,
     )
