@@ -24,14 +24,35 @@ _EXPORTS = {
         "precision.precision.summaries",
         "compute_contributions_from_params",
     ),
+    "ROIResult": ("precision.precision.roi", "ROIResult"),
+    "ROIInterval": ("precision.precision.roi", "ROIInterval"),
+    "ROIIntervalTS": ("precision.precision.roi", "ROIIntervalTS"),
+    "ROIUncertainty": ("precision.precision.roi", "ROIUncertainty"),
+    "compute_roi": ("precision.precision.roi", "compute_roi"),
+    "compute_roi_from_draws": ("precision.precision.roi", "compute_roi_from_draws"),
+    "compute_roas": ("precision.precision.roi", "compute_roas"),
     "posterior_mean": ("precision.precision.summaries", "posterior_mean"),
     "summarise_decay_rates": ("precision.precision.summaries", "summarise_decay_rates"),
     "fourier_seasonality": ("precision.precision.controls", "fourier_seasonality"),
     "holiday_flags": ("precision.precision.controls", "holiday_flags"),
     "stack_controls": ("precision.precision.controls", "stack_controls"),
+    "fit_media_scales_pre_adstock_tactical": (
+        "precision.precision.scaling",
+        "fit_media_scales_pre_adstock_tactical",
+    ),
+    "apply_pre_adstock_tactical": (
+        "precision.precision.scaling",
+        "apply_pre_adstock_tactical",
+    ),
+    "center_y": ("precision.precision.scaling", "center_y"),
     "ensemble": ("precision.precision.ensemble", "ensemble"),
     "PerModelResult": ("precision.precision.ensemble", "PerModelResult"),
     "EnsembleResult": ("precision.precision.ensemble", "EnsembleResult"),
+    "psis_loo_pointwise": ("precision.precision.psis", "psis_loo_pointwise"),
+    "stacking_weights_from_pointwise_logdens": (
+        "precision.precision.psis",
+        "stacking_weights_from_pointwise_logdens",
+    ),
 }
 
 
