@@ -10,6 +10,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from .adstock import DTYPE
+from .constants import HALF_LIFE_MIN
 from .posterior import ParamSpec, TargetLogProbFn
 
 
@@ -49,6 +50,7 @@ class PosteriorSamples:
     tau0: np.ndarray | None = None
     lambda_local: np.ndarray | None = None
     s_sat: np.ndarray | None = None
+    phi: np.ndarray | None = None
     eta_channel: np.ndarray | None = None
     eta_platform: np.ndarray | None = None
     eta_tactical: np.ndarray | None = None
@@ -82,6 +84,7 @@ class PosteriorSamples:
             if self.lambda_local is None
             else _stack_last_two(self.lambda_local),
             s_sat=None if self.s_sat is None else _stack_last_two(self.s_sat),
+            phi=None if self.phi is None else _stack_last_two(self.phi),
             eta_channel=None
             if self.eta_channel is None
             else _stack_last_two(self.eta_channel),
@@ -170,7 +173,7 @@ def run_nuts(
     elif mode == "half_life":
         log_h = name_to_tensor["log_h"]
         h = np.exp(log_h)
-        delta = np.power(2.0, -1.0 / np.maximum(h, 1e-6))
+        delta = np.power(2.0, -1.0 / np.maximum(h, HALF_LIFE_MIN))
         extras = dict(half_life=h, logit_delta=None, mu_c=None, tau_c=None)
     elif mode == "hier_logit":
         logit_delta = name_to_tensor["logit_delta"]
@@ -216,6 +219,7 @@ def run_nuts(
     tau0 = name_to_tensor.get("tau0")
     lambda_local = name_to_tensor.get("lambda_local")
     s_sat = name_to_tensor.get("s_sat")
+    phi = name_to_tensor.get("phi")
 
     return PosteriorSamples(
         beta0=name_to_tensor["beta0"],
@@ -233,6 +237,7 @@ def run_nuts(
         tau0=tau0,
         lambda_local=lambda_local,
         s_sat=s_sat,
+        phi=phi,
         eta_channel=eta_channel,
         eta_platform=eta_platform,
         eta_tactical=eta_tactical,

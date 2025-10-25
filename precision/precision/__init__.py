@@ -33,6 +33,10 @@ _EXPORTS = {
     "compute_roas": ("precision.precision.roi", "compute_roas"),
     "posterior_mean": ("precision.precision.summaries", "posterior_mean"),
     "summarise_decay_rates": ("precision.precision.summaries", "summarise_decay_rates"),
+    "log_likelihood_draws_single_model": (
+        "precision.precision.summaries",
+        "log_likelihood_draws_single_model",
+    ),
     "fourier_seasonality": ("precision.precision.controls", "fourier_seasonality"),
     "holiday_flags": ("precision.precision.controls", "holiday_flags"),
     "stack_controls": ("precision.precision.controls", "stack_controls"),

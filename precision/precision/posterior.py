@@ -10,6 +10,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from .adstock import DTYPE, adstock_geometric_tf
+from .constants import SAT_MIN, HALF_LIFE_MIN, SIGMA_MIN
 from .hierarchy import Hierarchy
 from .priors import Priors, normalize_beta_structure
 from .scaling import (
@@ -39,7 +40,7 @@ class ParamSpec:
 def _saturate_log1p(x: tf.Tensor, s: tf.Tensor) -> tf.Tensor:
     """Apply the concave saturation transform elementwise."""
 
-    s_safe = tf.maximum(s, tf.cast(1e-9, DTYPE))
+    s_safe = tf.maximum(s, tf.cast(SAT_MIN, DTYPE))
     return s_safe * tf.math.log1p(x / s_safe)
 
 
@@ -52,7 +53,28 @@ def make_target_log_prob_fn(
     normalize_adstock: bool = True,
     priors: Priors = Priors(),
 ) -> Tuple[TargetLogProbFn, Dict[str, int], List[ParamSpec]]:
-    """Create a TensorFlow Probability target log-probability function."""
+    """
+    Create a TensorFlow Probability target log-probability function.
+
+    Returns:
+      - target_log_prob: closure over named constrained parameters in `param_spec`.
+      - dims: dict with keys (as available)
+          T: int, time length
+          N_t: int, # of leaf tacticals
+          J: int, # of controls
+          mode: str, decay mode {"beta","half_life","hier_logit"}
+          residual_mode: str, {"iid","ar1"}
+          beta_structure: str
+          levels: list[str]
+          level_sizes: dict[level->int]
+          leaf_level: str
+          beta_level: str
+          pool_parent_level: Optional[str]
+          tactical_rescale: np.ndarray (shape [N_t])
+          y_mean: float (if priors.center_y)
+          C, P: Optional[int] legacy counts if present
+      - param_spec: list[ParamSpec] describing parameter bijectors and init values.
+    """
 
     const = lambda value: tf.constant(value, dtype=DTYPE)
 
@@ -90,6 +112,14 @@ def make_target_log_prob_fn(
     U_tf = tf.convert_to_tensor(U_scaled, dtype=DTYPE)
 
     leaf_level, beta_level, pool_parent = priors.resolve_beta_levels(hierarchy.levels)
+    # Early validation: pool parent must be a strict ancestor of beta_level if provided.
+    if pool_parent is not None:
+        child_idx = hierarchy.levels.index(beta_level)
+        parent_idx = hierarchy.levels.index(pool_parent)
+        if parent_idx <= child_idx:
+            raise ValueError(
+                f"pool_parent_level={pool_parent!r} must be an ancestor of beta_level={beta_level!r}"
+            )
     level_sizes = {level: int(hierarchy.size(level)) for level in hierarchy.levels}
     M_leaf_to_beta = tf.constant(hierarchy.map(leaf_level, beta_level), dtype=DTYPE)
     child_to_parent: Optional[tf.Tensor] = None
@@ -121,6 +151,7 @@ def make_target_log_prob_fn(
     )
     prior_eta = tfd.Normal(loc=const(priors.lift_log_mu), scale=const(priors.lift_log_sd))
     prior_tau = tfd.HalfNormal(scale=const(priors.beta_pool_sd))
+    prior_phi = tfd.Normal(loc=const(0.0), scale=const(priors.phi_prior_sd))
 
     beta_structure = normalize_beta_structure(priors.beta_structure)
     sparsity = priors.sparsity_prior
@@ -140,6 +171,8 @@ def make_target_log_prob_fn(
         param_spec.append(
             ParamSpec("s_sat", (), tfb.Exp(), const(priors.sat_log_mu))
         )
+    if priors.residual_mode == "ar1":
+        param_spec.append(ParamSpec("phi", (), tfb.Tanh(), tf.zeros([], DTYPE)))
     eta_parent_name: Optional[str] = None
     eta_beta_name = f"eta_{beta_level}"
     beta_size = level_sizes[beta_level]
@@ -238,7 +271,7 @@ def make_target_log_prob_fn(
 
         def delta_from_args(log_h: tf.Tensor) -> tf.Tensor:
             h = tf.exp(log_h)
-            return tf.pow(const(2.0), -1.0 / tf.maximum(h, const(1e-6)))
+            return tf.pow(const(2.0), -1.0 / tf.maximum(h, const(HALF_LIFE_MIN)))
 
         def log_prior_decay(log_h: tf.Tensor) -> tf.Tensor:
             return tf.reduce_sum(prior_log_h.log_prob(log_h))
@@ -302,8 +335,8 @@ def make_target_log_prob_fn(
     if like_family not in {"normal", "student_t"}:
         raise ValueError(f"Unknown priors.likelihood={like_family!r}")
 
-    if priors.residual_mode != "iid":
-        raise NotImplementedError("Only IID residuals are supported in this build")
+    if priors.residual_mode not in {"iid", "ar1"}:
+        raise NotImplementedError(f"Unknown residual_mode={priors.residual_mode!r}")
 
     nu = const(priors.student_t_df)
 
@@ -313,16 +346,34 @@ def make_target_log_prob_fn(
         beta0: tf.Tensor,
         gamma: tf.Tensor,
         sigma: tf.Tensor,
+        phi: Optional[tf.Tensor],
     ) -> tf.Tensor:
         mean = beta0 + tf.linalg.matvec(series, beta_vec)
         if num_controls > 0:
             mean = mean + tf.linalg.matvec(Z_tf, gamma)
 
-        if like_family == "normal":
-            dist = tfd.Normal(loc=mean, scale=sigma)
+        sigma_safe = tf.maximum(sigma, const(SIGMA_MIN))
+
+        if priors.residual_mode == "iid":
+            if like_family == "normal":
+                dist = tfd.Normal(loc=mean, scale=sigma_safe)
+            else:
+                dist = tfd.StudentT(df=nu, loc=mean, scale=sigma_safe)
+            return tf.reduce_sum(dist.log_prob(y_tf))
         else:
-            dist = tfd.StudentT(df=nu, loc=mean, scale=sigma)
-        return tf.reduce_sum(dist.log_prob(y_tf))
+            z = y_tf - mean
+            if tf.size(z) == 0:
+                return tf.constant(0.0, dtype=DTYPE)
+            if phi is None:
+                raise ValueError("phi is required when residual_mode='ar1'")
+            z0 = z[:1] * tf.sqrt(const(1.0) - phi * phi)
+            z1 = z[1:] - phi * z[:-1]
+            zt = tf.concat([z0, z1], axis=0)
+            if like_family == "normal":
+                dist = tfd.Normal(loc=const(0.0), scale=sigma_safe)
+            else:
+                dist = tfd.StudentT(df=nu, loc=const(0.0), scale=sigma_safe)
+            return tf.reduce_sum(dist.log_prob(zt))
 
     def _tactical_series(delta: tf.Tensor, s_param: Optional[tf.Tensor]) -> tf.Tensor:
         series = adstock_geometric_tf(U_tf, delta, normalize=normalize_adstock)
@@ -358,15 +409,20 @@ def make_target_log_prob_fn(
         gamma = tensors["gamma"]
         sigma = tensors["sigma"]
         s_sat = tensors.get("s_sat")
+        phi = tensors.get("phi")
         decay_args = [tensors[name] for name in decay_param_names]
         delta = delta_from_args(*decay_args)
         tactical_series = _tactical_series(delta, s_sat)
         series_beta = tf.linalg.matmul(tactical_series, M_leaf_to_beta)
         eta_beta = tensors[eta_beta_name]
         beta_vec = tf.exp(eta_beta)
-        ll = _log_likelihood(series_beta, beta_vec, beta0, gamma, sigma)
+        ll = _log_likelihood(series_beta, beta_vec, beta0, gamma, sigma, phi)
 
         lp = _log_prior_common(beta0, gamma, sigma, s_sat)
+        if priors.residual_mode == "ar1":
+            if phi is None:
+                raise ValueError("phi is required when residual_mode='ar1'")
+            lp += prior_phi.log_prob(phi)
         if pool_parent is None:
             lp += tf.reduce_sum(prior_eta.log_prob(eta_beta))
         else:
@@ -404,9 +460,10 @@ def make_target_log_prob_fn(
         "N_t": num_tacticals,
         "J": num_controls,
         "mode": decay_mode,
+        "residual_mode": priors.residual_mode,
         "beta_structure": beta_structure,
         "use_saturation": priors.use_saturation,
-        "tactical_rescale": tactical_rescale.tolist(),
+        "tactical_rescale": np.asarray(tactical_rescale, dtype=float),
         "y_mean": y_mean,
         "levels": list(hierarchy.levels),
         "level_sizes": dict(level_sizes),
