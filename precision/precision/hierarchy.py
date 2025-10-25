@@ -3,114 +3,206 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
 
 @dataclass
 class Hierarchy:
-    """Represents the mapping between tacticals, platforms, and channels."""
+    """Representation of an arbitrary N-level hierarchy."""
 
-    channel_names: List[str]
-    platform_names: List[str]
-    tactical_names: List[str]
-    M_tp: np.ndarray  # tacticals -> platforms
-    M_tc: np.ndarray  # tacticals -> channels
-    t_to_p: np.ndarray  # tactical index -> platform index
-    p_to_c: np.ndarray  # platform index -> channel index
+    levels: List[str]
+    names: Dict[str, List[str]]
+    maps_adjacent: Dict[Tuple[str, str], np.ndarray]
+    index_adjacent: Dict[Tuple[str, str], np.ndarray]
+
+    def size(self, level: str) -> int:
+        """Return the number of nodes at ``level``."""
+
+        try:
+            return len(self.names[level])
+        except KeyError as exc:  # pragma: no cover - defensive programming
+            raise KeyError(f"Unknown level {level!r}") from exc
+
+    def map(self, child: str, parent: str) -> np.ndarray:
+        """Return the cumulative mapping matrix from ``child`` to ``parent`` levels."""
+
+        child_idx = self.levels.index(child)
+        parent_idx = self.levels.index(parent)
+        if child_idx == parent_idx:
+            size = self.size(child)
+            return np.eye(size, dtype=float)
+        if child_idx > parent_idx:
+            raise ValueError(
+                "Mapping is only defined from a lower level to a higher level in the hierarchy"
+            )
+
+        result = None
+        for level_idx in range(child_idx, parent_idx):
+            c = self.levels[level_idx]
+            p = self.levels[level_idx + 1]
+            M = self.maps_adjacent[(c, p)]
+            result = M if result is None else result @ M
+        assert result is not None  # for mypy; parent_idx > child_idx ensured a matrix was set
+        return result
+
+    def index_map(self, child: str, parent: str) -> np.ndarray:
+        """Return the parent index for each ``child`` element."""
+
+        child_idx = self.levels.index(child)
+        parent_idx = self.levels.index(parent)
+        if child_idx == parent_idx:
+            return np.arange(self.size(child), dtype=int)
+        if child_idx > parent_idx:
+            raise ValueError(
+                "Index mapping is only defined from a lower level to a higher level in the hierarchy"
+            )
+
+        indices = self.index_adjacent[(self.levels[child_idx], self.levels[child_idx + 1])].copy()
+        for level_idx in range(child_idx + 1, parent_idx):
+            lvl = self.levels[level_idx]
+            nxt = self.levels[level_idx + 1]
+            indices = self.index_adjacent[(lvl, nxt)][indices]
+        return indices
 
     @property
     def num_channels(self) -> int:
+        if "channel_names" not in self.__dict__:
+            raise AttributeError("channel_names not available for this hierarchy")
         return len(self.channel_names)
 
     @property
     def num_platforms(self) -> int:
+        if "platform_names" not in self.__dict__:
+            raise AttributeError("platform_names not available for this hierarchy")
         return len(self.platform_names)
 
     @property
     def num_tacticals(self) -> int:
+        if "tactical_names" not in self.__dict__:
+            raise AttributeError("tactical_names not available for this hierarchy")
         return len(self.tactical_names)
 
 
-def _ensure_unique(values: Sequence[str], level: str) -> None:
-    if len(set(values)) != len(values):
-        raise ValueError(f"Duplicate {level} names detected: {values}")
+def _compat_three_level_fields(hierarchy: Hierarchy) -> Dict[str, object]:
+    """Return legacy 3-level attributes for backwards compatibility."""
+
+    if len(hierarchy.levels) < 3:
+        return {}
+
+    bottom, middle, top = hierarchy.levels[:3]
+    compat: Dict[str, object] = {
+        f"{level}_names": hierarchy.names[level]
+        for level in hierarchy.levels
+    }
+
+    compat.update(
+        {
+            "M_tp": hierarchy.map(bottom, middle),
+            "M_tc": hierarchy.map(bottom, top),
+            "t_to_p": hierarchy.index_map(bottom, middle),
+            "p_to_c": hierarchy.index_map(middle, top),
+        }
+    )
+
+    return compat
 
 
-def build_hierarchy(
-    spec: Dict[str, Dict[str, Sequence[str]]],
-    *,
-    keep_order: bool = True,
-) -> Hierarchy:
-    """Create hierarchy mappings from a nested specification.
+def build_hierarchy(tree: Dict, levels: Sequence[str]) -> Hierarchy:
+    """Build an N-level hierarchy from a uniform top->bottom nested ``tree``.
 
-    Args:
-        spec: A nested mapping of channel -> platform -> list of tacticals.
-        keep_order: If ``True`` (default), preserve the insertion order of the
-            specification. If ``False``, channel, platform, and tactical names
-            are sorted alphabetically.
-
-    Returns:
-        Hierarchy dataclass containing name lists and aggregation matrices.
+    Use :func:`pad_ragged_tree` before this function if your input skips levels.
     """
 
-    if not spec:
-        raise ValueError("spec must contain at least one channel")
+    levels = list(levels)
+    if not levels:
+        raise ValueError("levels must contain at least one level name")
+    if not isinstance(tree, dict):
+        raise TypeError("tree must be a dict mapping parent names to child subtrees")
+    if not tree:
+        raise ValueError("tree must contain at least one entry")
 
-    channel_names = list(spec.keys()) if keep_order else sorted(spec.keys())
-    _ensure_unique(channel_names, "channel")
+    names: Dict[str, List[str]] = {level: [] for level in levels}
+    edges: Dict[Tuple[str, str], List[Tuple[int, int]]] = {
+        (levels[idx], levels[idx + 1]): [] for idx in range(len(levels) - 1)
+    }
 
-    platform_names: List[str] = []
-    tactical_names: List[str] = []
-    p_to_c_idx: List[int] = []
-    t_to_p_idx: List[int] = []
+    def add_node(level: str, name: str) -> int:
+        if not isinstance(name, str):
+            raise TypeError("Hierarchy node names must be strings")
+        index = len(names[level])
+        names[level].append(name)
+        return index
 
-    for c_idx, c_name in enumerate(channel_names):
-        platforms = spec[c_name]
-        if not platforms:
-            raise ValueError(f"Channel '{c_name}' must contain at least one platform")
-        platform_keys = list(platforms.keys()) if keep_order else sorted(platforms.keys())
-        _ensure_unique(platform_keys, "platform")
-        for p_name in platform_keys:
-            p_idx = len(platform_names)
-            platform_names.append(p_name)
-            p_to_c_idx.append(c_idx)
+    def walk(parent_level_idx: int, parent_name: str, subtree) -> int:
+        level = levels[parent_level_idx]
+        parent_idx = add_node(level, parent_name)
 
-            tacticals = platforms[p_name]
-            if not tacticals:
+        if parent_level_idx == 0:
+            if subtree not in (None, [], {}):
                 raise ValueError(
-                    f"Platform '{p_name}' within channel '{c_name}' must contain tacticals"
+                    f"Leaf level '{level}' entries should not have child nodes; received {subtree!r}"
                 )
-            tactical_list = list(tacticals) if keep_order else sorted(tacticals)
-            _ensure_unique(tactical_list, "tactical")
-            for tactical_name in tactical_list:
-                tactical_names.append(tactical_name)
-                t_to_p_idx.append(p_idx)
+            return parent_idx
 
-    num_tacticals = len(tactical_names)
-    num_platforms = len(platform_names)
-    num_channels = len(channel_names)
+        child_level_idx = parent_level_idx - 1
+        child_level = levels[child_level_idx]
 
-    t_to_p = np.array(t_to_p_idx, dtype=int)
-    p_to_c = np.array(p_to_c_idx, dtype=int)
+        if child_level_idx == 0:
+            if not isinstance(subtree, list):
+                raise TypeError("Leaf level requires a list of names")
+            if len(subtree) == 0:
+                raise ValueError(f"Leaf list for {parent_name!r} cannot be empty")
+            seen: set[str] = set()
+            for leaf_name in subtree:
+                if not isinstance(leaf_name, str):
+                    raise TypeError("Leaf names must be strings")
+                if leaf_name in seen:
+                    raise ValueError(f"Duplicate {child_level} name detected: {leaf_name!r}")
+                seen.add(leaf_name)
+                leaf_idx = add_node(child_level, leaf_name)
+                edges[(child_level, level)].append((leaf_idx, parent_idx))
+            return parent_idx
 
-    M_tp = np.zeros((num_tacticals, num_platforms), dtype=np.float64)
-    for tactical_idx, platform_idx in enumerate(t_to_p):
-        M_tp[tactical_idx, platform_idx] = 1.0
+        if not isinstance(subtree, dict):
+            raise TypeError(f"Internal level {level!r} requires a dict of children")
+        if not subtree:
+            raise ValueError(f"{level!r} entry {parent_name!r} must contain at least one child")
 
-    M_pc = np.zeros((num_platforms, num_channels), dtype=np.float64)
-    for platform_idx, channel_idx in enumerate(p_to_c):
-        M_pc[platform_idx, channel_idx] = 1.0
+        for child_name, child_subtree in subtree.items():
+            child_idx = walk(child_level_idx, child_name, child_subtree)
+            edges[(child_level, level)].append((child_idx, parent_idx))
 
-    M_tc = M_tp @ M_pc
+        return parent_idx
 
-    return Hierarchy(
-        channel_names=channel_names,
-        platform_names=platform_names,
-        tactical_names=tactical_names,
-        M_tp=M_tp,
-        M_tc=M_tc,
-        t_to_p=t_to_p,
-        p_to_c=p_to_c,
+    for top_name, subtree in tree.items():
+        walk(len(levels) - 1, top_name, subtree)
+
+    maps_adjacent: Dict[Tuple[str, str], np.ndarray] = {}
+    index_adjacent: Dict[Tuple[str, str], np.ndarray] = {}
+    for idx in range(len(levels) - 1):
+        child_level, parent_level = levels[idx], levels[idx + 1]
+        n_child = len(names[child_level])
+        n_parent = len(names[parent_level])
+        mapping = np.zeros((n_child, n_parent), dtype=float)
+        parent_indices = np.zeros(n_child, dtype=int)
+
+        for child_idx, parent_idx in edges[(child_level, parent_level)]:
+            mapping[child_idx, parent_idx] = 1.0
+            parent_indices[child_idx] = parent_idx
+
+        if not np.all(mapping.sum(axis=1) == 1.0):
+            raise ValueError(f"Invalid hierarchy: each {child_level} must map to exactly one {parent_level}")
+
+        maps_adjacent[(child_level, parent_level)] = mapping
+        index_adjacent[(child_level, parent_level)] = parent_indices
+
+    hierarchy = Hierarchy(
+        levels=levels,
+        names=names,
+        maps_adjacent=maps_adjacent,
+        index_adjacent=index_adjacent,
     )
+    hierarchy.__dict__.update(_compat_three_level_fields(hierarchy))
+    return hierarchy
