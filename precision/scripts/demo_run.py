@@ -28,6 +28,22 @@ def main(seed: int = 123) -> None:
     tree_uniform = pad_ragged_tree(tree_ragged, levels)
     hierarchy = build_hierarchy(tree_uniform, levels)
 
+    # Quick sanity checks on the hierarchy maps
+    for k in range(len(levels) - 1):
+        child_level, parent_level = levels[k], levels[k + 1]
+        M_adjacent = hierarchy.maps_adjacent[(child_level, parent_level)]
+        assert M_adjacent.shape == (
+            hierarchy.size(child_level),
+            hierarchy.size(parent_level),
+        )
+        assert (M_adjacent.sum(axis=1) == 1).all()
+
+    if len(levels) >= 3:
+        child, mid, parent = levels[0], levels[1], levels[2]
+        M_direct = hierarchy.map(child, parent)
+        M_via_mid = hierarchy.map(child, mid) @ hierarchy.map(mid, parent)
+        assert np.allclose(M_direct, M_via_mid)
+
     leaf_level = hierarchy.levels[0]
     beta_level = hierarchy.levels[1]
     top_level = hierarchy.levels[2]
