@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 
 
-@dataclass
+@dataclass(init=False)
 class Hierarchy:
     """Representation of an arbitrary N-level hierarchy."""
 
@@ -16,6 +16,136 @@ class Hierarchy:
     names: Dict[str, List[str]]
     maps_adjacent: Dict[Tuple[str, str], np.ndarray]
     index_adjacent: Dict[Tuple[str, str], np.ndarray]
+
+    def __init__(
+        self,
+        *,
+        levels: Sequence[str] | None = None,
+        names: Dict[str, Sequence[str]] | None = None,
+        maps_adjacent: Dict[Tuple[str, str], np.ndarray] | None = None,
+        index_adjacent: Dict[Tuple[str, str], np.ndarray] | None = None,
+        **legacy_kwargs: Any,
+    ) -> None:
+        """Support both modern and legacy construction signatures.
+
+        The modern API constructs a :class:`Hierarchy` from explicit ``levels``,
+        ``names``, ``maps_adjacent``, and ``index_adjacent`` arguments (used by
+        :func:`build_hierarchy`).  Older code paths instantiated ``Hierarchy``
+        directly by passing channel / platform / tactical metadata and mapping
+        matrices.  To keep those workflows working we translate the legacy
+        arguments into the new representation here.
+        """
+
+        if (
+            levels is not None
+            or names is not None
+            or maps_adjacent is not None
+            or index_adjacent is not None
+        ):
+            if None in (levels, names, maps_adjacent, index_adjacent):
+                raise TypeError(
+                    "Hierarchy() requires levels, names, maps_adjacent, and index_adjacent when using the structured API"
+                )
+            if legacy_kwargs:
+                extra = ", ".join(sorted(legacy_kwargs))
+                raise TypeError(
+                    "Hierarchy() structured API does not accept legacy keyword(s): " + extra
+                )
+
+            self.levels = list(levels or [])
+            self.names = {
+                level: [str(name) for name in seq]
+                for level, seq in (names or {}).items()
+            }
+            self.maps_adjacent = {
+                key: np.asarray(matrix, dtype=float)
+                for key, matrix in (maps_adjacent or {}).items()
+            }
+            self.index_adjacent = {
+                key: np.asarray(indices, dtype=int)
+                for key, indices in (index_adjacent or {}).items()
+            }
+        else:
+            self._init_from_legacy(**legacy_kwargs)
+
+        # Populate legacy convenience attributes (M_tp, etc.) when applicable.
+        self.__dict__.update(_compat_three_level_fields(self))
+
+    def _init_from_legacy(self, **legacy_kwargs: Any) -> None:
+        required = {
+            "channel_names",
+            "platform_names",
+            "tactical_names",
+            "M_tp",
+            "M_tc",
+            "t_to_p",
+            "p_to_c",
+        }
+        missing = sorted(required.difference(legacy_kwargs))
+        if missing:
+            raise TypeError(
+                "Hierarchy() legacy signature missing required arguments: "
+                + ", ".join(missing)
+            )
+
+        unexpected = sorted(set(legacy_kwargs) - required)
+        if unexpected:
+            raise TypeError(
+                "Hierarchy() legacy signature received unexpected keyword(s): "
+                + ", ".join(unexpected)
+            )
+
+        tactical_names = [str(name) for name in legacy_kwargs["tactical_names"]]
+        platform_names = [str(name) for name in legacy_kwargs["platform_names"]]
+        channel_names = [str(name) for name in legacy_kwargs["channel_names"]]
+
+        levels = ["tactical", "platform", "channel"]
+        self.levels = levels
+        self.names = {
+            "tactical": tactical_names,
+            "platform": platform_names,
+            "channel": channel_names,
+        }
+
+        M_tp = np.asarray(legacy_kwargs["M_tp"], dtype=float)
+        M_tc = np.asarray(legacy_kwargs["M_tc"], dtype=float)
+        t_to_p = np.asarray(legacy_kwargs["t_to_p"], dtype=int)
+        p_to_c = np.asarray(legacy_kwargs["p_to_c"], dtype=int)
+
+        num_tactical = len(tactical_names)
+        num_platform = len(platform_names)
+        num_channel = len(channel_names)
+
+        if M_tp.shape != (num_tactical, num_platform):
+            raise ValueError("M_tp shape does not match tactical/platform dimensions")
+        if M_tc.shape != (num_tactical, num_channel):
+            raise ValueError("M_tc shape does not match tactical/channel dimensions")
+        if t_to_p.shape != (num_tactical,):
+            raise ValueError("t_to_p must provide a parent index for each tactical")
+        if p_to_c.shape != (num_platform,):
+            raise ValueError("p_to_c must provide a parent index for each platform")
+        if not np.all((t_to_p >= 0) & (t_to_p < num_platform)):
+            raise ValueError("t_to_p indices must be within platform range")
+        if not np.all((p_to_c >= 0) & (p_to_c < num_channel)):
+            raise ValueError("p_to_c indices must be within channel range")
+
+        map_tp = M_tp.astype(float, copy=True)
+        map_pc = np.zeros((num_platform, num_channel), dtype=float)
+        map_pc[np.arange(num_platform), p_to_c] = 1.0
+
+        # Validate that the implied tactical->channel mapping matches the provided M_tc.
+        implied_tc = map_tp @ map_pc
+        if not np.allclose(implied_tc, M_tc):
+            raise ValueError("Provided M_tc is inconsistent with M_tp and p_to_c mappings")
+
+        self.maps_adjacent = {
+            ("tactical", "platform"): map_tp,
+            ("platform", "channel"): map_pc,
+        }
+        self.index_adjacent = {
+            ("tactical", "platform"): t_to_p.astype(int, copy=True),
+            ("platform", "channel"): p_to_c.astype(int, copy=True),
+        }
 
     def size(self, level: str) -> int:
         """Return the number of nodes at ``level``."""

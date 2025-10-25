@@ -11,7 +11,7 @@ import tensorflow_probability as tfp
 
 from .adstock import DTYPE, adstock_geometric_tf
 from .hierarchy import Hierarchy
-from .priors import Priors
+from .priors import Priors, normalize_beta_structure
 from .scaling import (
     apply_pre_adstock_tactical,
     center_y as _center_y,
@@ -122,10 +122,8 @@ def make_target_log_prob_fn(
     prior_eta = tfd.Normal(loc=const(priors.lift_log_mu), scale=const(priors.lift_log_sd))
     prior_tau = tfd.HalfNormal(scale=const(priors.beta_pool_sd))
 
-    beta_structure = priors.beta_structure
+    beta_structure = normalize_beta_structure(priors.beta_structure)
     sparsity = priors.sparsity_prior
-    if beta_structure not in {"channel", "platform_hier", "tactical_hier"}:
-        raise ValueError(f"Unknown priors.beta_structure={beta_structure!r}")
     if sparsity not in {"none", "horseshoe"}:
         raise ValueError(f"Unknown priors.sparsity_prior={sparsity!r}")
     if beta_structure != "tactical_hier" and sparsity != "none":
