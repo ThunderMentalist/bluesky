@@ -173,6 +173,8 @@ def test_beta_per_tactical_helper_priority():
         ("platform_hier", "none"),
         ("tactical_hier", "none"),
         ("tactical_hier", "horseshoe"),
+        ("legacy_three_level", "none"),
+        ("platform_channel", "none"),
     ],
 )
 def test_make_target_log_prob_fn_beta_structures_smoke(beta_structure: str, sparsity: str):
@@ -205,13 +207,16 @@ def test_make_target_log_prob_fn_beta_structures_smoke(beta_structure: str, spar
     U = np.ones((T, N_t), dtype=float)
 
     priors = Priors(beta_structure=beta_structure, sparsity_prior=sparsity)
-    target_fn, _dims, param_spec = make_target_log_prob_fn(
+    target_fn, dims, param_spec = make_target_log_prob_fn(
         y=y,
         U_tactical=U,
         Z_controls=None,
         hierarchy=hierarchy,
         priors=priors,
     )
+
+    assert dims["C"] == hierarchy.num_channels
+    assert dims["P"] == hierarchy.num_platforms
 
     params = [tf.convert_to_tensor(p.init) for p in param_spec]
     value = target_fn(*params)

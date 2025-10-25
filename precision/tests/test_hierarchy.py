@@ -95,3 +95,23 @@ def test_pad_ragged_tree_fills_missing_levels(levels):
 
     assert placeholder in hierarchy.names["platform"]
     assert "t1" in hierarchy.names["tactical"]
+
+
+def test_hierarchy_legacy_constructor():
+    M_tp = np.array([[1.0], [1.0]])
+    M_tc = np.array([[1.0], [1.0]])
+    hierarchy = Hierarchy(
+        channel_names=["c1"],
+        platform_names=["p1"],
+        tactical_names=["t1", "t2"],
+        M_tp=M_tp,
+        M_tc=M_tc,
+        t_to_p=np.array([0, 0], dtype=int),
+        p_to_c=np.array([0], dtype=int),
+    )
+
+    assert hierarchy.levels == ["tactical", "platform", "channel"]
+    np.testing.assert_allclose(hierarchy.M_tp, M_tp)
+    np.testing.assert_allclose(hierarchy.M_tc, M_tc)
+    np.testing.assert_array_equal(hierarchy.t_to_p, np.array([0, 0], dtype=int))
+    np.testing.assert_array_equal(hierarchy.p_to_c, np.array([0], dtype=int))

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, cast
 
 import numpy as np
 
@@ -13,6 +13,24 @@ ResidualMode = Literal["iid", "ar1"]
 BetaStructure = Literal["channel", "platform_hier", "tactical_hier"]
 SparsityPrior = Literal["none", "horseshoe"]
 MediaStandardize = Literal["none", "pre_adstock_tactical"]
+
+_BETA_STRUCTURE_ALIASES = {
+    "legacy_three_level": "platform_hier",
+    "three_level": "platform_hier",
+    "platform_channel": "platform_hier",
+    "legacy": "platform_hier",
+    "tactical": "tactical_hier",
+}
+
+
+def normalize_beta_structure(value: str) -> BetaStructure:
+    """Map historical beta_structure names onto the modern enum values."""
+
+    key = value.lower()
+    canonical = _BETA_STRUCTURE_ALIASES.get(key, key)
+    if canonical not in {"channel", "platform_hier", "tactical_hier"}:
+        raise ValueError(f"Unknown beta_structure={value!r}")
+    return cast(BetaStructure, canonical)
 
 
 @dataclass(frozen=True)
@@ -80,21 +98,23 @@ class Priors:
         if self.beta_level:
             return leaf, self.beta_level, self.pool_parent_level
 
-        if self.beta_structure == "channel":
+        beta_structure = normalize_beta_structure(self.beta_structure)
+
+        if beta_structure == "channel":
             return leaf, hierarchy_levels[2], None
 
-        if self.beta_structure == "platform_hier":
+        if beta_structure == "platform_hier":
             return leaf, hierarchy_levels[1], hierarchy_levels[2]
 
-        if self.beta_structure == "tactical_hier":
+        if beta_structure == "tactical_hier":
             return leaf, leaf, hierarchy_levels[2]
-
         raise ValueError(f"Unknown beta_structure={self.beta_structure!r}")
 
 
 __all__ = [
     "BetaStructure",
     "DecayMode",
+    "normalize_beta_structure",
     "LikelihoodFamily",
     "MediaStandardize",
     "ResidualMode",
