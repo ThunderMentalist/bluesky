@@ -1,0 +1,1 @@
+Smoke test for PR creation on 2026-07-01.
